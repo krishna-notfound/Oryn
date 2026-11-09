@@ -52,6 +52,9 @@ class GnaniTimbreTTS(TextToSpeech):
         self._settings = settings
         self._client = client
         self._backoff = tuple(backoff)
+        # The account answers 429 to a second simultaneous request (seen live), so synthesis
+        # requests queue here instead of failing and retrying with a backoff.
+        self._slots = asyncio.Semaphore(settings.gnani_tts_max_concurrent)
         self._url = f"{settings.gnani_base_url.rstrip('/')}/api/v1/tts/sse"
         self._headers = {"X-API-Key-ID": settings.gnani_api_key.get_secret_value()}
         self.output_format = AudioFormat(sample_rate=settings.gnani_tts_sample_rate)
@@ -63,8 +66,9 @@ class GnaniTimbreTTS(TextToSpeech):
         for delay in (*self._backoff, None):
             started = False
             try:
-                # aclosing: a cancelled consumer must close the HTTP response immediately.
-                async with contextlib.aclosing(self._stream_once(body)) as chunks:
+                # The slot is held per attempt, never across a retry sleep. aclosing: a
+                # cancelled consumer must close the HTTP response immediately.
+                async with self._slots, contextlib.aclosing(self._stream_once(body)) as chunks:
                     async for pcm in chunks:
                         started = True
                         yield pcm

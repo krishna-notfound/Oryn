@@ -1,7 +1,14 @@
-"""Embeddings from any OpenAI-compatible `POST {base}/embeddings` endpoint."""
+"""Embeddings from any OpenAI-compatible `POST {base}/embeddings` endpoint.
+
+Verified live against Gemini's compat endpoint, which differs from OpenAI in two ways: rows
+carry no `index` (they come back in input order) and the vector size defaults to 3072, so the
+configured `dimensions` is always sent. Truncated Gemini vectors are not unit length, so every
+vector is normalised: the memory index ranks by L2 distance, which then orders like cosine.
+"""
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import Any
 
@@ -34,14 +41,17 @@ class OpenAICompatibleEmbedder(Embedder):
             return []
         try:
             response = await self._client.post(
-                self._url, json={"model": self._model, "input": list(texts)}, headers=self._headers
+                self._url,
+                json={"model": self._model, "input": list(texts), "dimensions": self.dimensions},
+                headers=self._headers,
             )
         except httpx.TransportError as exc:
             raise ProviderError(NAME, f"transport error: {exc!r}", retryable=True) from exc
         if response.status_code != 200:
             raise await error_from_response(NAME, response)
-        rows: list[dict[str, Any]] = sorted(response.json()["data"], key=lambda r: r["index"])
-        vectors = [row["embedding"] for row in rows]
+        rows: list[dict[str, Any]] = response.json()["data"]
+        rows.sort(key=lambda row: row.get("index", 0))  # stable: no index means input order
+        vectors = [_normalised(row["embedding"]) for row in rows]
         if len(vectors) != len(texts):
             raise ProviderError(NAME, f"expected {len(texts)} embeddings, got {len(vectors)}")
         if len(vectors[0]) != self.dimensions:
@@ -49,3 +59,8 @@ class OpenAICompatibleEmbedder(Embedder):
                 NAME, f"model returned {len(vectors[0])}-d vectors, configured {self.dimensions}"
             )
         return vectors
+
+
+def _normalised(vector: list[float]) -> list[float]:
+    norm = math.sqrt(sum(x * x for x in vector))
+    return [x / norm for x in vector] if norm else vector

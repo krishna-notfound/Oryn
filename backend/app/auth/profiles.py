@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 
 _COLUMNS = (
     "preferred_name,primary_language,extra_languages,style,response_length,"
-    "listen_first,memory_enabled,timezone,interests"
+    "listen_first,memory_enabled,save_history,timezone,interests"
 )
 
 

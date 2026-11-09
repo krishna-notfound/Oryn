@@ -97,7 +97,9 @@ class SarvamLanguageModel(LanguageModel):
                         break
                     for choice in json.loads(data).get("choices", ()):  # usage chunk: no choices
                         delta = choice.get("delta") or {}
-                        if text := delta.get("content"):  # `reasoning_content` is never spoken
+                        if text := delta.get(
+                            "content"
+                        ):  # reasoning deltas use another key and are never spoken
                             yield LLMChunk(text=text)
                         self._collect_tool_calls(pending, delta.get("tool_calls") or ())
                         finish_reason = choice.get("finish_reason") or finish_reason
@@ -119,9 +121,9 @@ class SarvamLanguageModel(LanguageModel):
             "stream": True,
             "temperature": s.llm_temperature,
             "max_tokens": s.llm_max_tokens,
-            # Thinking is on by default and would delay the first spoken token (and can eat
-            # a small max_tokens budget entirely).
-            "reasoning_effort": "none",
+            # No `reasoning_effort`: the conversations model does not think by default and the
+            # API rejects "none" (only low|medium|high). `sarvam-105b` always thinks (streamed
+            # as `delta.reasoning`) and would eat this small token budget, so it is unsuitable.
         }
         if tools:
             body["tools"] = [to_wire_tool(t) for t in tools]

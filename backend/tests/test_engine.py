@@ -339,6 +339,14 @@ async def test_voice_turn_reports_metrics_once(harness: Harness) -> None:
     assert metrics.interrupt_to_stop_ms is None
 
 
+async def test_audio_end_mark_does_not_leak_into_the_next_utterance(harness: Harness) -> None:
+    engine, _ = harness.build()
+    await engine.start()
+    await engine.on_audio_end()  # e.g. after the transcript already arrived via server VAD
+    await engine.on_audio(bytes(640))  # next utterance begins
+    assert engine._speech_end is None
+
+
 async def test_playback_finished_before_done_is_ignored(harness: Harness) -> None:
     engine, sink = harness.build(llm=FakeLanguageModel(LONG_REPLY, delay=0.01))
     await speak_one_turn(engine)

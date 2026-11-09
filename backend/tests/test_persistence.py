@@ -52,6 +52,7 @@ async def test_profile_request_targets_verified_user_with_service_key() -> None:
     assert request.url.params["id"] == f"eq.{USER}"
     assert request.headers["apikey"] == KEY
     assert request.headers["authorization"] == f"Bearer {KEY}"
+    assert "save_history" in request.url.params["select"]  # privacy opt-out must be loaded
 
 
 async def test_profile_row_maps_to_user_context() -> None:
@@ -63,6 +64,7 @@ async def test_profile_row_maps_to_user_context() -> None:
         "response_length": "detailed",
         "listen_first": False,
         "memory_enabled": True,
+        "save_history": False,
         "timezone": "Asia/Dubai",
         "interests": ["cricket"],
     }
@@ -76,6 +78,7 @@ async def test_profile_row_maps_to_user_context() -> None:
         response_length="detailed",
         listen_first=False,
         memory_enabled=True,
+        save_history=False,
         timezone="Asia/Dubai",
         interests=("cricket",),
     )

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import SecretStr
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, SecretStr, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -15,7 +16,8 @@ class Settings(BaseSettings):
 
     app_env: Literal["development", "test", "production"] = "development"
     provider_mode: Literal["live", "fake"] = "live"
-    cors_origins: list[str] = ["http://localhost:3000"]
+    # Env value may be a bare origin, a comma-separated list, or a JSON array.
+    cors_origins: Annotated[list[str], NoDecode] = ["http://localhost:3000"]
     log_level: str = "INFO"
 
     # Supabase
@@ -32,6 +34,7 @@ class Settings(BaseSettings):
     gnani_tts_model: str = "timbre-v2.5"
     gnani_tts_voice: str = ""
     gnani_tts_sample_rate: int = 24_000
+    gnani_tts_max_concurrent: int = Field(default=1, ge=1)  # simultaneous synth requests
 
     # Sarvam conversational LLM
     sarvam_api_key: SecretStr | None = None
@@ -55,6 +58,16 @@ class Settings(BaseSettings):
     max_tool_calls_per_turn: int = 3
     session_handshake_timeout_s: float = 5.0
     session_max_duration_s: float = 15 * 60
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def _split_origins(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        text = value.strip()
+        if text.startswith("["):
+            return json.loads(text)
+        return [origin.strip() for origin in text.split(",") if origin.strip()]
 
 
 @lru_cache

@@ -1,8 +1,10 @@
 """Supabase access-token verification.
 
 Supabase signs user JWTs either with a shared HS256 secret (legacy projects) or
-with an asymmetric key published at the project's JWKS endpoint (current
-projects). The authenticator picks the mode from settings. Every failure becomes
+with an asymmetric key published at the project's JWKS endpoint (current projects, ES256;
+verified live). A project mid-migration can hold both kinds, so the key source is chosen
+per token from its `alg` header, and each source only ever accepts its own algorithms
+(no algorithm confusion). Every failure becomes
 a bare `AuthError`: the reason is logged, never returned to the client.
 """
 
@@ -52,7 +54,7 @@ class SupabaseAuthenticator:
         # vouches for the token.
         self._issuer = f"{base}/auth/v1" if base else None
         self._jwks = jwks_client
-        if self._jwks is None and self._secret is None and base:
+        if self._jwks is None and base:
             self._jwks = jwt.PyJWKClient(
                 f"{base}/auth/v1/.well-known/jwks.json",
                 lifespan=_JWKS_TTL_S,
@@ -71,8 +73,9 @@ class SupabaseAuthenticator:
             raise AuthError from None
 
     async def _decode(self, token: str) -> dict[str, Any]:
-        if self._secret is not None:
-            key: Any = self._secret
+        key: Any
+        if jwt.get_unverified_header(token).get("alg") == "HS256" and self._secret is not None:
+            key = self._secret
             algorithms = ["HS256"]
         elif self._jwks is not None:
             # PyJWKClient does blocking HTTP on a cache miss.

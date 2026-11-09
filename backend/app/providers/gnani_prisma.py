@@ -30,7 +30,8 @@ from app.providers.http import RETRYABLE_STATUSES
 
 NAME = "gnani-prisma"
 FRAME_BYTES = 1024  # 512 samples; Prisma wants exactly this size per binary frame
-CONNECT_TIMEOUT_S = 5.0
+CONNECT_TIMEOUT_S = 5.0  # the upgrade alone takes 2-3 s
+MAX_IDLE_TIMEOUT_S = 900
 ERROR_CLOSE_GRACE_S = 1.0  # Prisma sends `error` then closes; wait briefly for the close code
 _ABNORMAL_CLOSE = 1006
 
@@ -175,6 +176,9 @@ class GnaniPrismaSTT(SpeechToText):
             "model": self._settings.gnani_stt_model,
             "x-sample-rate": str(self.input_format.sample_rate),
             "format": self._settings.gnani_stt_format,
+            # Default is 60 s without a speech segment, after which Prisma errors and closes
+            # (1001); a reconnect costs ~2.5 s. Allow the maximum, which is the 15 min cap.
+            "x-idle-timeout-sec": str(MAX_IDLE_TIMEOUT_S),
         }
         try:
             # No client pings: audio flows continuously and Prisma enforces its own idle timeout.

@@ -195,14 +195,6 @@ class VoiceSession:
         conversation_id = await self._resolve_conversation(user.user_id, start)
         conversation = svc.conversation_factory(context, start, self._sink, conversation_id)
         self._conversation = conversation
-        await self._sink.send_event(
-            SessionReady(
-                session_id=self.session_id,
-                conversation_id=conversation_id,
-                input_sample_rate=INPUT_SAMPLE_RATE,
-                output_sample_rate=svc.settings.gnani_tts_sample_rate,
-            )
-        )
         try:
             await conversation.start()
         except ProviderError as exc:
@@ -212,6 +204,16 @@ class VoiceSession:
                 "provider_unavailable",
                 "Voice service is unavailable, please retry.",
             )
+        # Ready only now: opening the STT stream takes seconds, and a client that streams the mic
+        # on `session.ready` would otherwise queue a burst that trips the frame rate limit.
+        await self._sink.send_event(
+            SessionReady(
+                session_id=self.session_id,
+                conversation_id=conversation_id,
+                input_sample_rate=INPUT_SAMPLE_RATE,
+                output_sample_rate=svc.settings.gnani_tts_sample_rate,
+            )
+        )
         log.info("session started", extra={"session_id": self.session_id, "user_id": user.user_id})
         return conversation
 

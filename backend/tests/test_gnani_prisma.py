@@ -101,6 +101,7 @@ async def test_sends_config_headers_exact_frames_and_maps_events() -> None:
     assert server.headers["model"] == "prisma-v3.0"
     assert server.headers["x-sample-rate"] == "16000"
     assert server.headers["format"] == "codemix"
+    assert server.headers["x-idle-timeout-sec"] == "900"
 
 
 async def test_finish_without_pending_audio_only_commits() -> None:
