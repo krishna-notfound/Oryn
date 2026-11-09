@@ -40,6 +40,14 @@ class TranscriptEvent:
     confidence: float | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class SpeechStarted:
+    """Provider-side VAD heard the user start talking (used for server-side barge-in)."""
+
+
+STTEvent = TranscriptEvent | SpeechStarted
+
+
 class SpeechToTextStream(ABC):
     """One live recognition stream. Adapters without true streaming may buffer
     audio and transcribe on `finish()` - but must never pretend to stream."""
@@ -53,8 +61,8 @@ class SpeechToTextStream(ABC):
         """The user stopped speaking; flush and emit a final transcript."""
 
     @abstractmethod
-    def events(self) -> AsyncIterator[TranscriptEvent]:
-        """Partial and final transcripts, in order."""
+    def events(self) -> AsyncIterator[STTEvent]:
+        """Speech-start signals and partial/final transcripts, in order."""
 
     @abstractmethod
     async def close(self) -> None:

@@ -13,7 +13,9 @@ from app.providers.base import (
     LanguageModel,
     LLMChunk,
     SpeechToText,
+    SpeechStarted,
     SpeechToTextStream,
+    STTEvent,
     TextToSpeech,
     ToolSpec,
     TranscriptEvent,
@@ -24,20 +26,22 @@ class FakeSpeechToTextStream(SpeechToTextStream):
     def __init__(self, transcript: str, delay: float) -> None:
         self._transcript = transcript
         self._delay = delay
-        self._queue: asyncio.Queue[TranscriptEvent | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[STTEvent | None] = asyncio.Queue()
         self._bytes_seen = 0
+        self._started = False
 
     async def send_audio(self, chunk: bytes) -> None:
         self._bytes_seen += len(chunk)
-        if self._bytes_seen and self._queue.empty():
-            await self._queue.put(TranscriptEvent(self._transcript.split()[0], is_final=False))
+        if not self._started:
+            self._started = True
+            await self._queue.put(SpeechStarted())
 
     async def finish(self) -> None:
         await asyncio.sleep(self._delay)
         await self._queue.put(TranscriptEvent(self._transcript, is_final=True, language="en-IN"))
         await self._queue.put(None)
 
-    async def events(self) -> AsyncIterator[TranscriptEvent]:
+    async def events(self) -> AsyncIterator[STTEvent]:
         while (event := await self._queue.get()) is not None:
             yield event
 

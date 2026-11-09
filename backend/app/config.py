@@ -1,0 +1,61 @@
+"""Application settings. The only place that reads the environment."""
+
+from __future__ import annotations
+
+from functools import lru_cache
+from pathlib import Path
+from typing import Literal
+
+from pydantic import SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    app_env: Literal["development", "test", "production"] = "development"
+    provider_mode: Literal["live", "fake"] = "live"
+    cors_origins: list[str] = ["http://localhost:3000"]
+    log_level: str = "INFO"
+
+    # Supabase
+    supabase_url: str = ""
+    supabase_jwt_secret: SecretStr | None = None
+    supabase_service_role_key: SecretStr | None = None
+
+    # Gnani — one key for Prisma (STT) and Timbre (TTS)
+    gnani_api_key: SecretStr | None = None
+    gnani_base_url: str = "https://api.vachana.ai"
+    gnani_stt_ws_url: str = "wss://api.vachana.ai/stt/v3/stream"
+    gnani_stt_model: str = "prisma-v3.0"
+    gnani_stt_format: str = "codemix"
+    gnani_tts_model: str = "timbre-v2.5"
+    gnani_tts_voice: str = ""
+    gnani_tts_sample_rate: int = 24_000
+
+    # Sarvam conversational LLM
+    sarvam_api_key: SecretStr | None = None
+    sarvam_base_url: str = "https://api.sarvam.ai"
+    llm_model: str = ""
+    llm_temperature: float = 0.6
+    llm_max_tokens: int = 300
+    llm_timeout_s: float = 20.0
+
+    # Embeddings (OpenAI-compatible) for memory retrieval
+    embeddings_base_url: str = ""
+    embeddings_api_key: SecretStr | None = None
+    embeddings_model: str = ""
+
+    # Memory
+    memory_db_path: Path = Path("./data/memory.db")
+
+    # Conversation / session limits
+    context_max_turns: int = 12
+    max_tool_calls_per_turn: int = 3
+    session_handshake_timeout_s: float = 5.0
+    session_max_duration_s: float = 15 * 60
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
