@@ -1,16 +1,19 @@
 /**
- * Exact TypeScript mirror of backend/app/websocket/protocol.py.
- * Spec: docs/context/websocket-contract.md. Change both files together.
+ * Protocol v2 mirror of backend/app/websocket/protocol.py (spec: realtime-pipeline-v2 design §7).
+ * Change both files together. This module has no runtime imports so it is unit-testable in Node.
  *
+ * Text frames: JSON `{"v":2,"type",...}` (client -> server) and
+ *   `{"v":2,"type","session_id","turn_id"?,"generation_id"?,"seq","ts", ...payload}` (server -> client).
  * Binary frames:
- *   client -> server : PCM s16le mono at SessionReady.input_sample_rate
- *   server -> client : uint32 big-endian generation_id + PCM s16le
- *                      at AssistantAudioStart.sample_rate
+ *   client -> server : PCM s16le mono at SessionReady.input_sample_rate, <= MAX_AUDIO_FRAME_BYTES
+ *   server -> client : uint32 BE generation_id + uint32 BE seq (per-generation chunk index) + PCM s16le
+ *                      at AudioStarted.sample_rate
  */
 
+export const PROTOCOL_VERSION = 2;
 export const MAX_AUDIO_FRAME_BYTES = 32_768;
 export const MAX_TEXT_CHARS = 2_000;
-export const AUDIO_HEADER_BYTES = 4;
+export const AUDIO_HEADER_BYTES = 8;
 
 export const VOICE_STATES = [
   "IDLE",
@@ -26,140 +29,125 @@ export type VoiceState = (typeof VOICE_STATES)[number];
 
 // ---------------------------------------------------------------- client -> server
 
-export interface SessionStart {
-  type: "session.start";
-  token: string;
-  language: string;
-  mode: "voice" | "text";
-  conversation_id?: string | null;
-}
-export interface UserText {
-  type: "user.text";
-  text: string;
-}
-export interface UserInterrupt {
-  type: "user.interrupt";
-}
-export interface AudioEnd {
-  type: "audio.end";
-}
-export interface PlaybackStarted {
-  type: "playback.started";
-  generation_id: number;
-}
-export interface PlaybackFinished {
-  type: "playback.finished";
-  generation_id: number;
-}
-export interface SessionEnd {
-  type: "session.end";
-}
-export interface Ping {
-  type: "ping";
-}
-
 export type ClientMessage =
-  | SessionStart
-  | UserText
-  | UserInterrupt
-  | AudioEnd
-  | PlaybackStarted
-  | PlaybackFinished
-  | SessionEnd
-  | Ping;
+  | { type: "session.start"; token: string; language: string; mode: "voice" | "text"; conversation_id?: string | null }
+  | { type: "input.speech_started"; ts: number }
+  | { type: "input.speech_ended"; ts: number }
+  | { type: "user.text"; text: string }
+  | { type: "turn.cancel"; generation_id: number }
+  | { type: "playback.started"; generation_id: number; client_latency_ms?: number }
+  | { type: "playback.finished"; generation_id: number }
+  | { type: "turn.metrics"; turn_id: number; generation_id: number; perceived_ms: number; playback_lead_ms: number }
+  | { type: "heartbeat" }
+  | { type: "session.end" };
 
 // ---------------------------------------------------------------- server -> client
 
-export interface SessionReady {
-  type: "session.ready";
+export interface Envelope {
+  v: 2;
   session_id: string;
-  conversation_id: string;
-  input_sample_rate: number;
-  output_sample_rate: number;
+  turn_id?: number;
+  generation_id?: number;
+  seq: number;
+  ts: number;
 }
-export interface StateChanged {
-  type: "state";
-  state: VoiceState;
-}
-export interface TranscriptPartial {
-  type: "transcript.partial";
-  text: string;
-}
-export interface TranscriptFinal {
-  type: "transcript.final";
-  turn_id: number;
-  text: string;
-  language?: string | null;
-}
-export interface AssistantText {
-  type: "assistant.text";
-  generation_id: number;
-  delta: string;
-}
-export interface AssistantAudioStart {
-  type: "assistant.audio.start";
-  generation_id: number;
-  sample_rate: number;
-  encoding: "pcm_s16le";
-}
-export interface AssistantDone {
-  type: "assistant.done";
-  generation_id: number;
-  text: string;
-}
-export interface Interrupted {
-  type: "interrupted";
-  generation_id: number;
-}
-/** All durations in milliseconds; null/absent when the stage did not run. */
-export interface TurnMetrics {
-  type: "metrics";
-  turn_id: number;
-  generation_id: number;
+
+/** Server marks for one turn (ms); absent/null when the stage did not run. */
+export interface ServerTurnMetrics {
   stt_ms?: number | null;
   llm_ttft_ms?: number | null;
+  segmentation_ms?: number | null;
+  tts_slot_wait_ms?: number | null;
   tts_ttfb_ms?: number | null;
+  server_first_audio_ms?: number | null;
   speech_end_to_first_audio_ms?: number | null;
   interrupt_to_stop_ms?: number | null;
 }
-export interface ErrorEvent {
-  type: "error";
-  code: string;
-  message: string;
-  retryable: boolean;
-}
-export interface Pong {
-  type: "pong";
-}
+
+type Scoped = { generation_id: number };
+
+export type SessionReady = Envelope & {
+  type: "session.ready";
+  conversation_id: string;
+  input_sample_rate: number;
+  output_sample_rate: number;
+  protocol: 2;
+};
+export type StateChanged = Envelope & { type: "state"; state: VoiceState };
+export type TranscriptFinal = Envelope & { type: "transcript.final"; text: string; language?: string | null };
+export type LlmStarted = Envelope & Scoped & { type: "llm.started" };
+export type TextDelta = Envelope & Scoped & { type: "text.delta"; delta: string };
+export type TextSegment = Envelope & Scoped & { type: "text.segment"; index: number; text: string };
+export type AudioStarted = Envelope & Scoped & { type: "audio.started"; sample_rate: number; encoding: "pcm_s16le" };
+export type AudioCompleted = Envelope & Scoped & { type: "audio.completed" };
+export type TurnCompleted = Envelope & Scoped & { type: "turn.completed"; text: string };
+export type TurnCancelled = Envelope & { type: "turn.cancelled"; reason: string; heard_text?: string | null };
+export type TurnMetricsEvent = Envelope & ServerTurnMetrics & { type: "turn.metrics" };
+export type PipelineError = Envelope & { type: "pipeline.error"; code: string; message: string; retryable: boolean };
+export type Heartbeat = Envelope & { type: "heartbeat" };
 
 export type ServerEvent =
   | SessionReady
   | StateChanged
-  | TranscriptPartial
   | TranscriptFinal
-  | AssistantText
-  | AssistantAudioStart
-  | AssistantDone
-  | Interrupted
-  | TurnMetrics
-  | ErrorEvent
-  | Pong;
+  | LlmStarted
+  | TextDelta
+  | TextSegment
+  | AudioStarted
+  | AudioCompleted
+  | TurnCompleted
+  | TurnCancelled
+  | TurnMetricsEvent
+  | PipelineError
+  | Heartbeat;
+
+/**
+ * Events tied to one assistant generation. The first six always carry `generation_id`;
+ * `turn.cancelled` / `turn.metrics` may not (e.g. a turn that failed before generating) and are
+ * then delivered ungated.
+ */
+export type GenerationEvent =
+  | LlmStarted
+  | TextDelta
+  | TextSegment
+  | AudioStarted
+  | AudioCompleted
+  | TurnCompleted
+  | TurnCancelled
+  | TurnMetricsEvent;
+
+const GENERATION_REQUIRED_TYPES: ReadonlySet<string> = new Set<GenerationEvent["type"]>([
+  "llm.started",
+  "text.delta",
+  "text.segment",
+  "audio.started",
+  "audio.completed",
+  "turn.completed",
+]);
+const GENERATION_EVENT_TYPES: ReadonlySet<string> = new Set<GenerationEvent["type"]>([
+  ...GENERATION_REQUIRED_TYPES,
+  "turn.cancelled",
+  "turn.metrics",
+] as GenerationEvent["type"][]);
 
 const SERVER_EVENT_TYPES: ReadonlySet<string> = new Set<ServerEvent["type"]>([
   "session.ready",
   "state",
-  "transcript.partial",
   "transcript.final",
-  "assistant.text",
-  "assistant.audio.start",
-  "assistant.done",
-  "interrupted",
-  "metrics",
-  "error",
-  "pong",
-]);
+  "pipeline.error",
+  "heartbeat",
+  ...GENERATION_EVENT_TYPES,
+] as ServerEvent["type"][]);
 
-/** Parses a text frame; returns null for anything that is not a known server event. */
+/** The generation id when `event` is gated by generation, otherwise undefined. */
+export function generationOf(event: ServerEvent): number | undefined {
+  return GENERATION_EVENT_TYPES.has(event.type) ? event.generation_id : undefined;
+}
+
+/**
+ * Parses a text frame; returns null for anything that is not a well-formed v2 server event
+ * (bad JSON, wrong version, unknown type, or a generation-scoped event without its id).
+ */
 export function parseServerEvent(raw: string): ServerEvent | null {
   let value: unknown;
   try {
@@ -168,20 +156,30 @@ export function parseServerEvent(raw: string): ServerEvent | null {
     return null;
   }
   if (typeof value !== "object" || value === null) return null;
-  const type = (value as { type?: unknown }).type;
-  if (typeof type !== "string" || !SERVER_EVENT_TYPES.has(type)) return null;
+  const record = value as { v?: unknown; type?: unknown; generation_id?: unknown };
+  if (record.v !== PROTOCOL_VERSION) return null;
+  if (typeof record.type !== "string" || !SERVER_EVENT_TYPES.has(record.type)) return null;
+  if (GENERATION_REQUIRED_TYPES.has(record.type) && !Number.isInteger(record.generation_id)) return null;
+  if (record.generation_id !== undefined && !Number.isInteger(record.generation_id)) return null;
   return value as ServerEvent;
 }
 
 export interface AudioFrame {
   generationId: number;
-  /** PCM s16le mono, header stripped. */
-  pcm: ArrayBuffer;
+  /** Per-generation chunk index. */
+  seq: number;
+  /** PCM s16le mono view over the received buffer (header skipped, no copy). */
+  samples: Int16Array;
 }
 
-/** Splits a binary frame into generation id (uint32 big-endian) and PCM payload. */
+/** Splits a binary frame into `>II` (generation_id, seq) and the PCM payload. */
 export function parseAudioFrame(buffer: ArrayBuffer): AudioFrame | null {
   if (buffer.byteLength <= AUDIO_HEADER_BYTES) return null;
-  const generationId = new DataView(buffer).getUint32(0, false);
-  return { generationId, pcm: buffer.slice(AUDIO_HEADER_BYTES) };
+  const view = new DataView(buffer);
+  const sampleCount = Math.floor((buffer.byteLength - AUDIO_HEADER_BYTES) / 2);
+  return {
+    generationId: view.getUint32(0, false),
+    seq: view.getUint32(4, false),
+    samples: new Int16Array(buffer, AUDIO_HEADER_BYTES, sampleCount),
+  };
 }

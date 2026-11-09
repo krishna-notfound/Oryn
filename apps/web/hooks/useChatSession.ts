@@ -22,7 +22,7 @@ export interface ChatSessionState {
   error: string | null;
 }
 
-/** Text fallback: the same WebSocket protocol with `mode: "text"` and no audio. */
+/** Text fallback: the same WebSocket protocol (v2) with `mode: "text"` and no audio. */
 export function useChatSession({ language }: { language: string }) {
   const [state, setState] = useState<ChatSessionState>({
     connection: "idle",
@@ -42,19 +42,19 @@ export function useChatSession({ language }: { language: string }) {
         case "state":
           setState((s) => ({ ...s, voiceState: event.state }));
           break;
-        case "assistant.text":
+        case "text.delta":
           setState((s) => ({ ...s, messages: appendDelta(s.messages, event.generation_id, event.delta, counter) }));
           break;
-        case "assistant.done":
+        case "turn.completed":
           setState((s) => ({ ...s, messages: finalize(s.messages, event.generation_id, event.text, counter) }));
           break;
-        case "interrupted":
+        case "turn.cancelled":
           setState((s) => ({
             ...s,
             messages: s.messages.map((m) => (m.generationId === event.generation_id ? { ...m, interrupted: true } : m)),
           }));
           break;
-        case "error":
+        case "pipeline.error":
           setState((s) => ({ ...s, error: event.message }));
           break;
         default:
@@ -69,7 +69,12 @@ export function useChatSession({ language }: { language: string }) {
       setState((s) => ({
         ...s,
         connection: "closed",
-        error: code === 4401 ? "Your session expired. Please sign in again." : "Connection lost.",
+        error:
+          code === 4401
+            ? "Your session expired. Please sign in again."
+            : code === 4503
+              ? "Oryn is busy right now. Please try again in a moment."
+              : "Connection lost.",
       }));
     });
     client.connect();
