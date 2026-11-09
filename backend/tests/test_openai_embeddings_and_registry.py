@@ -49,7 +49,20 @@ async def test_embeds_in_input_order_with_declared_dimensions() -> None:
     assert embedder.dimensions == 3
     assert str(seen[0].url) == "https://emb.example/v1/embeddings"
     assert seen[0].headers["authorization"] == "Bearer emb-key"
-    assert json.loads(seen[0].content) == {"model": "text-embed", "input": ["a", "b"]}
+    assert json.loads(seen[0].content) == {
+        "model": "text-embed",
+        "input": ["a", "b"],
+        "dimensions": 3,
+    }
+
+
+async def test_rows_without_index_keep_input_order_and_are_normalised() -> None:
+    """Gemini's OpenAI-compatible endpoint omits `index`."""
+    rows = [{"embedding": [3.0, 0.0, 0.0]}, {"embedding": [0.0, 0.0, 2.0]}]
+    embedder = make_embedder(
+        httpx.MockTransport(lambda _: httpx.Response(200, json={"data": rows}))
+    )
+    assert await embedder.embed(["a", "b"]) == [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
 
 
 async def test_rejects_vectors_of_unexpected_size() -> None:

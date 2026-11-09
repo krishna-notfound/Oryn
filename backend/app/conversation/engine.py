@@ -155,6 +155,7 @@ class VoiceConversation(Conversation):
     async def on_audio(self, chunk: bytes) -> None:
         if self._mode != "voice" or self._state.state in _DEAF_STATES:
             return
+        self._speech_end = None  # new audio: an earlier `audio.end` no longer belongs to a turn
         try:
             stream = self._stream or await self._open_stream()
             await stream.send_audio(chunk)

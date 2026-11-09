@@ -3,7 +3,7 @@ from typing import Any
 
 import jwt
 import pytest
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
@@ -119,6 +119,20 @@ async def test_jwks_path_rejects_hs256_token_downgrade() -> None:
     token = jwt.encode(_claims(), SECRET, algorithm="HS256")
     with pytest.raises(AuthError):
         await _rsa_authenticator(private.public_key()).verify(token)
+
+
+async def test_secret_and_jwks_coexist_and_es256_token_uses_jwks() -> None:
+    """Live project: ES256 tokens with a legacy HS256 secret still configured."""
+    private = ec.generate_private_key(ec.SECP256R1())
+    auth = SupabaseAuthenticator(
+        Settings(supabase_url=SUPABASE_URL, supabase_jwt_secret=SecretStr(SECRET)),
+        jwks_client=_StubJwksClient(private.public_key()),  # type: ignore[arg-type]
+    )
+    es256 = jwt.encode(_claims(), private, algorithm="ES256", headers={"kid": "k1"})
+    assert (await auth.verify(es256)).user_id == USER_ID
+    assert (await auth.verify(jwt.encode(_claims(), SECRET, algorithm="HS256"))).user_id == USER_ID
+    with pytest.raises(AuthError):
+        await auth.verify(jwt.encode(_claims(), "y" * 48, algorithm="HS256"))
 
 
 def _rest_app() -> FastAPI:

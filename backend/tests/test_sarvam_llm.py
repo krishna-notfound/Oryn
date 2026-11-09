@@ -53,10 +53,8 @@ async def test_streams_text_deltas_then_finish_reason() -> None:
     ]
 
 
-async def test_reasoning_content_is_never_yielded() -> None:
-    llm = make_llm(
-        lambda _: sse_body(delta(reasoning_content="thinking"), delta(content="ok"), "[DONE]")
-    )
+async def test_reasoning_deltas_are_never_yielded() -> None:
+    llm = make_llm(lambda _: sse_body(delta(reasoning="thinking"), delta(content="ok"), "[DONE]"))
     assert await run(llm) == [LLMChunk(text="ok")]
 
 
@@ -70,6 +68,46 @@ async def test_text_is_yielded_before_the_stream_ends() -> None:
     stream = llm.stream([ChatMessage("user", "hi")])
     assert await anext(stream) == LLMChunk(text="first")
     await stream.aclose()
+
+
+async def test_live_tool_call_shape_with_null_fields() -> None:
+    """Captured from sarvam-105b-conversations: absent fields are explicit nulls."""
+    llm = make_llm(
+        lambda _: sse_body(
+            delta(
+                tool_calls=[
+                    {
+                        "index": 0,
+                        "id": "chatcmpl-tool-9d72",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": None},
+                    }
+                ]
+            ),
+            delta(
+                tool_calls=[
+                    {
+                        "index": 0,
+                        "id": None,
+                        "function": {"name": None, "arguments": '{"city": "Mum'},
+                    }
+                ]
+            ),
+            delta(
+                tool_calls=[
+                    {"index": 0, "id": None, "function": {"name": None, "arguments": 'bai"}'}}
+                ]
+            ),
+            finish("tool_calls"),
+            "[DONE]",
+        )
+    )
+    assert await run(llm) == [
+        LLMChunk(
+            tool_calls=(ToolCall("chatcmpl-tool-9d72", "get_weather", {"city": "Mumbai"}),),
+            finish_reason="tool_calls",
+        )
+    ]
 
 
 async def test_fragmented_tool_calls_arrive_complete_in_one_chunk() -> None:
@@ -128,7 +166,7 @@ async def test_request_uses_v1_endpoint_key_header_and_conversational_model() ->
     body = json.loads(request.content)
     assert body["model"] == "sarvam-105b-conversations"
     assert body["stream"] is True
-    assert body["reasoning_effort"] == "none"
+    assert "reasoning_effort" not in body  # the API rejects "none" for this model
     assert body["messages"] == [{"role": "user", "content": "hi"}]
     assert body["tools"] == [
         {
