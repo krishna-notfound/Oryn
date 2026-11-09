@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Brain, MessageCircle, Mic, MicOff, PhoneOff, Settings, Volume2, VolumeX } from "lucide-react";
 import { useVoiceSession, type CallStatus } from "@/hooks/useVoiceSession";
-import type { TurnMetrics, VoiceState } from "@/lib/realtime/protocol";
+import type { ServerTurnMetrics, VoiceState } from "@/lib/realtime/protocol";
 import { Orb, toOrbState } from "./Orb";
 import { IconLink, TopBar } from "./ui";
 
@@ -41,24 +41,28 @@ function CallTimer({ startedAt }: { startedAt: number | null }) {
   );
 }
 
-/** Discreet latency readout for the last turn; details on hover/long-press via title. */
-function LatencyPill({ metrics }: { metrics: TurnMetrics | null }) {
-  const total = metrics?.speech_end_to_first_audio_ms;
-  if (!metrics || total == null) return null;
+/**
+ * Discreet latency readout for the last turn: what the user actually waited (speech end to
+ * first audible sound, measured in the browser). Server stage timings sit in the tooltip.
+ */
+function LatencyPill({ perceivedMs, metrics }: { perceivedMs: number | null; metrics: ServerTurnMetrics | null }) {
+  const shown = perceivedMs ?? metrics?.server_first_audio_ms ?? null;
+  if (shown == null) return null;
   const parts = [
-    ["stt", metrics.stt_ms],
-    ["llm", metrics.llm_ttft_ms],
-    ["tts", metrics.tts_ttfb_ms],
+    ["server", metrics?.server_first_audio_ms],
+    ["stt", metrics?.stt_ms],
+    ["llm", metrics?.llm_ttft_ms],
+    ["tts", metrics?.tts_ttfb_ms],
   ]
     .filter(([, value]) => value != null)
     .map(([name, value]) => `${name} ${Math.round(value as number)} ms`)
     .join(" · ");
   return (
     <span
-      title={parts}
+      title={perceivedMs != null ? `heard after ${perceivedMs} ms${parts ? ` · ${parts}` : ""}` : parts}
       className="type-label-sm rounded-full bg-surface-container px-2.5 py-1 tabular-nums text-on-surface-variant"
     >
-      {Math.round(total)} ms
+      {Math.round(shown)} ms
     </span>
   );
 }
@@ -89,7 +93,11 @@ function CallButton({
 export function TalkScreen({ name, language }: { name: string | null; language: string }) {
   const session = useVoiceSession({ language });
   const inCall = session.status === "connecting" || session.status === "live";
-  const orbState = toOrbState(session.voiceState, session.status === "live");
+  // The browser VAD hears the user before the server state catches up: show "listening" at once.
+  const orbState =
+    session.userSpeaking && session.voiceState !== "RECONNECTING" && session.voiceState !== "ERROR"
+      ? "listening"
+      : toOrbState(session.voiceState, session.status === "live");
 
   return (
     <div className="flex h-dvh flex-col">
@@ -98,7 +106,7 @@ export function TalkScreen({ name, language }: { name: string | null; language: 
           title="Live Voice Call"
           right={
             <>
-              <LatencyPill metrics={session.metrics} />
+              <LatencyPill perceivedMs={session.perceivedMs} metrics={session.metrics} />
               <span className="type-label-sm ml-1 inline-flex items-center gap-1 rounded-full bg-secondary-container/40 px-2.5 py-1 text-on-secondary-container">
                 <span className="size-1.5 animate-pulse rounded-full bg-secondary" />
                 <CallTimer startedAt={session.startedAt} />
@@ -221,7 +229,12 @@ function CallView({
   session: ReturnType<typeof useVoiceSession>;
   orbState: ReturnType<typeof toOrbState>;
 }) {
-  const label = session.status === "connecting" ? "Connecting…" : STATUS_LABEL[session.voiceState];
+  const label =
+    session.status === "connecting"
+      ? "Connecting…"
+      : session.userSpeaking && session.voiceState !== "RECONNECTING"
+        ? STATUS_LABEL.LISTENING
+        : STATUS_LABEL[session.voiceState];
   return (
     <div className="flex w-full flex-1 flex-col items-center justify-center gap-space-md py-space-md">
       <Orb state={orbState} getLevel={session.getLevel} />

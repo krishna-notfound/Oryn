@@ -20,7 +20,8 @@ export class MicCapture {
   private smoothedLevel = 0;
   private muted = false;
 
-  constructor(private readonly onFrame: (pcm: ArrayBuffer) => void) {}
+  /** `level` is the frame's RMS in 0..1, computed in the worklet before quantisation. */
+  constructor(private readonly onFrame: (pcm: ArrayBuffer, level: number) => void) {}
 
   /** Smoothed RMS input level in 0..1 (fast attack, ~80 ms release). */
   get level(): number {
@@ -88,6 +89,6 @@ export class MicCapture {
   private onWorkletFrame({ pcm, level }: WorkletFrame): void {
     if (this.muted) return;
     this.smoothedLevel = Math.max(level, this.smoothedLevel * LEVEL_RELEASE);
-    this.onFrame(pcm);
+    this.onFrame(pcm, level);
   }
 }

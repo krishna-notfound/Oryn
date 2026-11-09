@@ -1,7 +1,10 @@
+import { admitEvent, GenerationGate } from "./GenerationGate";
 import {
   MAX_AUDIO_FRAME_BYTES,
+  PROTOCOL_VERSION,
   parseAudioFrame,
   parseServerEvent,
+  type AudioFrame,
   type ClientMessage,
   type ServerEvent,
 } from "./protocol";
@@ -10,10 +13,12 @@ import { TypedEmitter } from "./TypedEmitter";
 export type ConnectionStatus = "idle" | "connecting" | "ready" | "reconnecting" | "closed";
 
 export interface RealtimeEvents {
-  /** Every parsed server JSON event, including `session.ready`. */
+  /** Every parsed server JSON event that is not tied to a stale generation. */
   event: ServerEvent;
-  /** One server audio frame: generation id + PCM s16le (header stripped). */
-  audio: { generationId: number; pcm: ArrayBuffer };
+  /** One audio frame of the current generation: `>II` header parsed, PCM as an Int16 view. */
+  audio: AudioFrame;
+  /** A new socket is about to open: drop anything tied to the previous connection's ids. */
+  reset: undefined;
   status: ConnectionStatus;
   /** Terminal: the client will not reconnect any more. */
   closed: { code: number; reason: string; byUser: boolean };
@@ -27,16 +32,20 @@ export interface RealtimeClientOptions {
   mode: "voice" | "text";
 }
 
-const PING_INTERVAL_MS = 20_000;
+const HEARTBEAT_INTERVAL_MS = 15_000;
 const RECONNECT_DELAYS_MS = [500, 1_000, 2_000, 2_000, 2_000];
-/** 4401 unauthenticated (a retry cannot help); 4409 replaced by a newer socket. */
-const NO_RETRY_CODES: ReadonlySet<number> = new Set([4401, 4409]);
+/** 4401 unauthenticated, 4409 replaced by a newer socket, 4503 server at capacity: a retry cannot help. */
+export const TERMINAL_CLOSE_CODES: ReadonlySet<number> = new Set([4401, 4409, 4503]);
+/** Local code for a server that does not speak protocol v2. */
+export const CLOSE_PROTOCOL_MISMATCH = 4426;
 /** Drop mic frames instead of queueing when the socket is backed up: stale audio is worthless. */
 const MAX_BUFFERED_BYTES = MAX_AUDIO_FRAME_BYTES * 8;
 
 /**
- * One WebSocket per conversation. Handshake: the first frame is `session.start` carrying the
- * Supabase access token. Reconnects with backoff and resumes the same conversation id.
+ * One WebSocket per conversation, protocol v2. Handshake: the first frame is `session.start`
+ * carrying the Supabase access token. Reconnects with backoff and resumes the same conversation id.
+ * Events and audio of a generation the app already cancelled (or that is older than the current
+ * one) never reach listeners.
  */
 export class RealtimeClient {
   readonly events = new TypedEmitter<RealtimeEvents>();
@@ -45,9 +54,10 @@ export class RealtimeClient {
   private status: ConnectionStatus = "idle";
   private conversationId: string | null = null;
   private attempt = 0;
-  private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
+  private readonly gate = new GenerationGate();
 
   constructor(private readonly options: RealtimeClientOptions) {}
 
@@ -71,12 +81,22 @@ export class RealtimeClient {
     return this.send({ type: "user.text", text });
   }
 
-  interrupt(): void {
-    this.send({ type: "user.interrupt" });
+  /** Client VAD edges, epoch ms. For `speechEnded` pass the last voiced frame, not the emission time. */
+  speechStarted(at: number): void {
+    this.send({ type: "input.speech_started", ts: Math.round(at) });
   }
 
-  audioEnd(): void {
-    this.send({ type: "audio.end" });
+  speechEnded(at: number): void {
+    this.send({ type: "input.speech_ended", ts: Math.round(at) });
+  }
+
+  /**
+   * Retires the generation locally, then tells the server. Nothing more of it is delivered even
+   * if the server needs a few more ms to stop; the client never waits for the server.
+   */
+  cancelTurn(generationId: number): void {
+    this.gate.retire(generationId);
+    this.send({ type: "turn.cancel", generation_id: generationId });
   }
 
   playbackStarted(generationId: number): void {
@@ -85,6 +105,17 @@ export class RealtimeClient {
 
   playbackFinished(generationId: number): void {
     this.send({ type: "playback.finished", generation_id: generationId });
+  }
+
+  /** Client-measured speech end -> first audible sample. */
+  turnMetrics(turnId: number, generationId: number, perceivedMs: number, playbackLeadMs: number): void {
+    this.send({
+      type: "turn.metrics",
+      turn_id: turnId,
+      generation_id: generationId,
+      perceived_ms: Math.round(perceivedMs),
+      playback_lead_ms: Math.round(playbackLeadMs),
+    });
   }
 
   /** Clean shutdown initiated by the user. Safe to call repeatedly. */
@@ -96,7 +127,7 @@ export class RealtimeClient {
 
   private send(message: ClientMessage): boolean {
     if (!this.ws || !this.isReady) return false;
-    this.ws.send(JSON.stringify(message));
+    this.ws.send(JSON.stringify({ v: PROTOCOL_VERSION, ...message }));
     return true;
   }
 
@@ -112,6 +143,10 @@ export class RealtimeClient {
     }
     if (this.disposed) return;
 
+    // Server ids restart per connection; a stale gate would drop or accept the wrong ones.
+    this.gate.reset();
+    this.events.emit("reset", undefined);
+
     const ws = new WebSocket(this.options.url);
     ws.binaryType = "arraybuffer";
     this.ws = ws;
@@ -124,7 +159,8 @@ export class RealtimeClient {
         mode: this.options.mode,
         ...(this.conversationId ? { conversation_id: this.conversationId } : {}),
       };
-      ws.send(JSON.stringify(start));
+      // Sent before `ready`, so it cannot go through send().
+      ws.send(JSON.stringify({ v: PROTOCOL_VERSION, ...start }));
     };
     ws.onmessage = (message) => this.onMessage(message.data);
     ws.onclose = (close) => this.onClose(ws, close.code, close.reason);
@@ -136,26 +172,30 @@ export class RealtimeClient {
       const event = parseServerEvent(data);
       if (!event) return;
       if (event.type === "session.ready") {
+        if (event.protocol !== PROTOCOL_VERSION) {
+          this.dispose(CLOSE_PROTOCOL_MISMATCH, "protocol mismatch", false);
+          return;
+        }
         this.conversationId = event.conversation_id;
         this.attempt = 0;
-        this.startPing();
+        this.startHeartbeat();
         this.setStatus("ready");
       }
-      this.events.emit("event", event);
+      if (admitEvent(this.gate, event)) this.events.emit("event", event);
     } else if (data instanceof ArrayBuffer) {
       const frame = parseAudioFrame(data);
-      if (frame) this.events.emit("audio", frame);
+      if (frame && this.gate.admit(frame.generationId) !== "drop") this.events.emit("audio", frame);
     }
   }
 
   private onClose(ws: WebSocket, code: number, reason: string): void {
     if (ws !== this.ws) return;
     this.ws = null;
-    this.stopPing();
+    this.stopHeartbeat();
     if (this.disposed) return;
 
     const retriesLeft = this.attempt < RECONNECT_DELAYS_MS.length;
-    if (NO_RETRY_CODES.has(code) || !retriesLeft) {
+    if (TERMINAL_CLOSE_CODES.has(code) || !retriesLeft) {
       this.dispose(code, reason, false);
       return;
     }
@@ -171,7 +211,7 @@ export class RealtimeClient {
   private dispose(code: number, reason: string, byUser: boolean): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.stopPing();
+    this.stopHeartbeat();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     const ws = this.ws;
     this.ws = null;
@@ -185,14 +225,14 @@ export class RealtimeClient {
     this.events.clear();
   }
 
-  private startPing(): void {
-    this.stopPing();
-    this.pingTimer = setInterval(() => this.send({ type: "ping" }), PING_INTERVAL_MS);
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => this.send({ type: "heartbeat" }), HEARTBEAT_INTERVAL_MS);
   }
 
-  private stopPing(): void {
-    if (this.pingTimer) clearInterval(this.pingTimer);
-    this.pingTimer = null;
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = null;
   }
 
   private setStatus(status: ConnectionStatus): void {
