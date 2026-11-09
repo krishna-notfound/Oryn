@@ -1,11 +1,11 @@
-"""Gnani Timbre text-to-speech over Server-Sent Events.
+"""Gnani Timbre text-to-speech over Server-Sent Events (the default transport).
 
-Transport choice: SSE over one long-lived pooled `httpx.AsyncClient`, not the TTS WebSocket.
-Keep-alive removes the per-sentence TLS handshake, and every synthesis is an independent
-request, so cancelling one (barge-in) just closes its response. The WebSocket has no cancel
-message, so aborting mid-synthesis would mean dropping the socket (a fresh handshake) or
-draining stale audio, and the docs recommend one request at a time per socket anyway. They
-also contradict themselves on whether config goes in upgrade headers or the JSON body.
+SSE over one long-lived pooled `httpx.AsyncClient`: keep-alive removes the per-sentence TLS
+handshake, and every synthesis is an independent request, so cancelling one (barge-in) just
+closes its response. The persistent-WebSocket alternative lives in `gnani_timbre_ws.py`
+(`GNANI_TTS_TRANSPORT=ws`); the live A/B (`scripts/tts_ab.py`) found no reliable TTFB win for it
+and a slower recovery after barge-in (the socket must be dropped and re-handshaken).
+Both transports share one account-wide slot semaphore (`account_slots`).
 """
 
 from __future__ import annotations
