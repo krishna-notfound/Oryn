@@ -47,7 +47,7 @@ Key only in the request header; prompts and replies are not logged.
 Text chunks arrive before the stream ends; fragmented tool calls come out whole; errors map as above.
 
 ## Test cases
-`backend/tests/test_sarvam_llm.py` (20 tests, `httpx.MockTransport`) and a live smoke test.
+`backend/tests/test_sarvam_llm.py` (18 tests, `httpx.MockTransport`) and a live smoke test.
 
 ## Implementation notes (what actually got built, deviations)
 - Default model lives in the adapter (`DEFAULT_MODEL`) because `Settings.llm_model` defaults to `""`
