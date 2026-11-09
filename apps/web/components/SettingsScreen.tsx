@@ -2,10 +2,10 @@
 
 import { useState, type ReactNode } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { Brain, ChevronRight, Languages, LogOut, Pencil, ShieldCheck, Smile, Mic2 } from "lucide-react";
+import { Brain, ChevronRight, Languages, Pencil, ShieldCheck, Smile, Mic2 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { INTERESTS, LANGUAGES, STYLES, languageLabel, type Profile } from "@/lib/profile";
+import { AccountSection } from "./AccountSection";
 import { Chip, Segmented, Toggle, TopBar } from "./ui";
 
 const CARD = "rounded-xl bg-surface-container-lowest p-space-md shadow-[0_4px_20px_-2px_rgba(31,32,36,0.04)]";
@@ -40,8 +40,7 @@ function Expandable({ row, children }: { row: ReactNode; children: ReactNode }) 
   );
 }
 
-export function SettingsScreen({ initial, email }: { initial: Profile; email: string }) {
-  const router = useRouter();
+export function SettingsScreen({ initial, email, isGuest }: { initial: Profile; email: string; isGuest: boolean }) {
   const [profile, setProfile] = useState(initial);
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(initial.preferred_name ?? "");
@@ -73,12 +72,6 @@ export function SettingsScreen({ initial, email }: { initial: Profile; email: st
     setNotice("Saved");
   }
 
-  async function signOut() {
-    await createClient().auth.signOut();
-    router.replace("/");
-    router.refresh();
-  }
-
   const style = STYLES.find((entry) => entry.id === profile.style);
 
   return (
@@ -90,7 +83,7 @@ export function SettingsScreen({ initial, email }: { initial: Profile; email: st
         <div className={`${CARD} flex items-center justify-between gap-space-md`}>
           <div className="flex min-w-0 flex-1 items-center gap-space-md">
             <div className="grid size-14 shrink-0 place-items-center rounded-full bg-gradient-to-tr from-primary-fixed via-primary-container to-secondary-container text-on-primary-container">
-              <span className="type-headline-sm">{(profile.preferred_name ?? email).charAt(0).toUpperCase()}</span>
+              <span className="type-headline-sm">{(profile.preferred_name ?? profile.username ?? email ?? "?").charAt(0).toUpperCase()}</span>
             </div>
             <div className="flex min-w-0 flex-1 flex-col">
               <span className="type-label-sm text-on-surface-variant">Profile name</span>
@@ -112,7 +105,7 @@ export function SettingsScreen({ initial, email }: { initial: Profile; email: st
               ) : (
                 <span className="type-headline-sm truncate text-on-surface">{profile.preferred_name ?? "Friend"}</span>
               )}
-              <span className="type-body-sm truncate text-outline">{email}</span>
+              <span className="type-body-sm truncate text-outline">{isGuest ? `@${profile.username ?? "guest"}` : email}</span>
             </div>
           </div>
           <button
@@ -286,19 +279,7 @@ export function SettingsScreen({ initial, email }: { initial: Profile; email: st
           <Toggle checked={profile.save_history} onChange={(value) => save({ save_history: value })} label="Save conversation history" />
         </div>
 
-        <div className="mt-auto flex flex-col items-center gap-space-md pt-space-md">
-          <button
-            type="button"
-            onClick={signOut}
-            className={`${CARD} type-label-lg flex min-h-14 w-full items-center justify-center gap-2 text-on-surface transition-all hover:bg-surface-container active:scale-[0.99]`}
-          >
-            <LogOut size={20} className="text-outline" aria-hidden="true" />
-            Sign out
-          </button>
-          <div className="flex flex-col items-center gap-0.5">
-            <span className="type-label-sm text-outline">Oryn v1.0 · An AI companion you can actually talk to</span>
-          </div>
-        </div>
+        <AccountSection isGuest={isGuest} username={profile.username} email={email} />
       </main>
     </div>
   );
