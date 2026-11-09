@@ -1,0 +1,17 @@
+# Automatic HTTPS (Let's Encrypt) for $ORYN_DOMAIN. WebSocket upgrades (wss://) are proxied
+# transparently by reverse_proxy, no extra config needed.
+#
+# No domain? A free hostname that maps to your IP works with Let's Encrypt:
+#   ORYN_DOMAIN=<elastic-ip-with-dashes>.sslip.io     e.g. 13-232-10-20.sslip.io
+{$ORYN_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy backend:8000 {
+		health_uri /health
+		health_interval 30s
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+}

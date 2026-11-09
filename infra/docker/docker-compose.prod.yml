@@ -1,0 +1,50 @@
+# Production stack on the EC2 box. Lives in /opt/oryn next to:
+#   .env          IMAGE_TAG (managed by deploy.sh) and ORYN_DOMAIN (set once by hand)
+#   backend.env   backend secrets (see docs/context/deployment.md)
+#   Caddyfile
+# Only Caddy publishes ports; the backend is reachable on the internal network only.
+
+services:
+  backend:
+    image: ghcr.io/krishna-notfound/oryn-backend:${IMAGE_TAG:?IMAGE_TAG is not set (deploy.sh writes it to .env)}
+    env_file: /opt/oryn/backend.env
+    environment:
+      # Fixed by the image layout; kept out of backend.env so it cannot drift.
+      MEMORY_DB_PATH: /data/memory.db
+    volumes:
+      - oryn-data:/data
+    restart: unless-stopped
+    mem_limit: 1200m
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"
+      interval: 15s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    stop_grace_period: 15s
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      ORYN_DOMAIN: ${ORYN_DOMAIN:?ORYN_DOMAIN is not set in /opt/oryn/.env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data      # issued certificates: losing this risks Let's Encrypt rate limits
+      - caddy-config:/config
+    restart: unless-stopped
+    mem_limit: 128m
+
+volumes:
+  oryn-data:
+  caddy-data:
+  caddy-config:
