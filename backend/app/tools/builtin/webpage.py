@@ -57,6 +57,10 @@ def is_public_address(address: str) -> bool:
     return ip.is_global and not ip.is_multicast
 
 
+def _host_header(host: str) -> str:
+    return f"[{host}]" if ":" in host else host  # IPv6 literals need brackets
+
+
 class _TextExtractor(HTMLParser):
     _SKIPPED = {"script", "style", "noscript", "template", "svg", "iframe"}
 
@@ -66,10 +70,12 @@ class _TextExtractor(HTMLParser):
         self._skip_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._parts.append(" ")  # tags separate words: <li>a</li><li>b</li> is "a b"
         if tag in self._SKIPPED:
             self._skip_depth += 1
 
     def handle_endtag(self, tag: str) -> None:
+        self._parts.append(" ")
         if tag in self._SKIPPED and self._skip_depth:
             self._skip_depth -= 1
 
@@ -152,7 +158,7 @@ class FetchWebpageTool(Tool[FetchArgs]):
         request = self._client.build_request(
             "GET",
             url.copy_with(host=address),
-            headers={"Host": url.host, "Accept": "text/html,text/plain;q=0.9"},
+            headers={"Host": _host_header(url.host), "Accept": "text/html,text/plain;q=0.9"},
             extensions={"sni_hostname": url.host},
             timeout=_REQUEST_TIMEOUT_S,
         )
