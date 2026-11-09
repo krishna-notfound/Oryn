@@ -1,4 +1,4 @@
-"""Per-turn latency marks and rolling p50/p95 aggregates."""
+"""Per-turn latency marks and rolling p50/p95/p99 aggregates."""
 
 from __future__ import annotations
 
@@ -11,24 +11,33 @@ from app.websocket.protocol import TurnMetrics
 
 Stage = Literal[
     "speech_end",
+    "commit_sent",
     "stt_final",
+    "turn_started",
     "llm_request",
     "llm_first_token",
+    "first_segment",
+    "tts_slot_acquired",
     "tts_request",
     "tts_first_byte",
     "first_audio_sent",
     "playback_started",
-    "interrupt",
-    "stop_complete",
+    "cancel_requested",
+    "cancel_completed",
 ]
 
 WINDOW = 200  # most recent turns kept per metric
+P99_MIN_SAMPLES = 20  # below this the 99th percentile is just the maximum
 METRICS = (
     "stt_ms",
     "llm_ttft_ms",
+    "segmentation_ms",
+    "tts_slot_wait_ms",
     "tts_ttfb_ms",
+    "server_first_audio_ms",
     "speech_end_to_first_audio_ms",
     "interrupt_to_stop_ms",
+    "perceived_ms",  # reported by the browser, see LatencyStats.record_perceived
 )
 
 
@@ -43,16 +52,17 @@ class TurnTimer:
         self._marks.setdefault(stage, perf_counter() if at is None else at)
 
     def metrics(self, turn_id: int, generation_id: int) -> TurnMetrics:
-        # Server VAD gives no "speech end", so latency is then measured from the final transcript.
-        origin = self._marks.get("speech_end", self._marks.get("stt_final"))
         return TurnMetrics(
             turn_id=turn_id,
             generation_id=generation_id,
             stt_ms=self._between("speech_end", "stt_final"),
             llm_ttft_ms=self._between("llm_request", "llm_first_token"),
+            segmentation_ms=self._between("llm_first_token", "first_segment"),
+            tts_slot_wait_ms=self._between("tts_request", "tts_slot_acquired"),
             tts_ttfb_ms=self._between("tts_request", "tts_first_byte"),
-            speech_end_to_first_audio_ms=_ms(origin, self._marks.get("first_audio_sent")),
-            interrupt_to_stop_ms=self._between("interrupt", "stop_complete"),
+            server_first_audio_ms=self._between("stt_final", "first_audio_sent"),
+            speech_end_to_first_audio_ms=self._between("speech_end", "first_audio_sent"),
+            interrupt_to_stop_ms=self._between("cancel_requested", "cancel_completed"),
         )
 
     def _between(self, start: Stage, end: Stage) -> float | None:
@@ -71,31 +81,40 @@ class LatencyStats:
 
     def record(self, metrics: TurnMetrics) -> None:
         for name, samples in self._samples.items():
-            if (value := getattr(metrics, name)) is not None:
+            if (value := getattr(metrics, name, None)) is not None:
                 samples.append(value)
 
+    def record_perceived(self, perceived_ms: float) -> None:
+        """The browser's own speech-end -> first audible audio measurement."""
+        self._samples["perceived_ms"].append(perceived_ms)
+
     def summary(self) -> dict[str, dict[str, float]]:
-        """`{metric: {"count", "p50", "p95"}}` for every metric with samples."""
-        return {
-            name: {
+        """`{metric: {"count", "p50", "p95", "p99"?}}` for every metric with samples; `p99`
+        appears once there are enough samples for it to mean something."""
+        out: dict[str, dict[str, float]] = {}
+        for name, samples in self._samples.items():
+            if not samples:
+                continue
+            row = {
                 "count": len(samples),
                 "p50": round(statistics.median(samples), 1),
-                "p95": round(_p95(samples), 1),
+                "p95": round(_percentile(samples, 95), 1),
             }
-            for name, samples in self._samples.items()
-            if samples
-        }
+            if len(samples) >= P99_MIN_SAMPLES:
+                row["p99"] = round(_percentile(samples, 99), 1)
+            out[name] = row
+        return out
 
     def clear(self) -> None:
         for samples in self._samples.values():
             samples.clear()
 
 
-def _p95(samples: deque[float]) -> float:
+def _percentile(samples: deque[float], q: int) -> float:
     if len(samples) < 2:
         return samples[0]
-    return statistics.quantiles(samples, n=20, method="inclusive")[-1]
+    return statistics.quantiles(samples, n=100, method="inclusive")[q - 1]
 
 
-# Process-wide aggregate; the app can expose `latency_stats.summary()` at /metrics.
+# Process-wide aggregate, served at /metrics.
 latency_stats = LatencyStats()

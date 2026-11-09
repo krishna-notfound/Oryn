@@ -37,7 +37,10 @@ VALID = [
     ('{"v":2,"type":"input.speech_ended","ts":1700000000250}', InputSpeechEnded),
     ('{"v":2,"type":"user.text","text":"hi"}', UserText),
     ('{"v":2,"type":"turn.cancel","generation_id":3}', TurnCancel),
-    ('{"v":2,"type":"playback.started","generation_id":3,"client_latency_ms":42.5}', PlaybackStarted),
+    (
+        '{"v":2,"type":"playback.started","generation_id":3,"client_latency_ms":42.5}',
+        PlaybackStarted,
+    ),
     ('{"v":2,"type":"playback.started","generation_id":3}', PlaybackStarted),
     ('{"v":2,"type":"playback.finished","generation_id":3}', PlaybackFinished),
     (
@@ -102,7 +105,9 @@ def test_server_event_is_wrapped_in_the_envelope() -> None:
 
 
 def test_ids_that_do_not_apply_are_omitted_not_null() -> None:
-    body = json.loads(encode_event(StateChanged(state=VoiceState.LISTENING), session_id="s", seq=1, ts=1))
+    body = json.loads(
+        encode_event(StateChanged(state=VoiceState.LISTENING), session_id="s", seq=1, ts=1)
+    )
     assert "turn_id" not in body and "generation_id" not in body
     assert body["state"] == "LISTENING"
 

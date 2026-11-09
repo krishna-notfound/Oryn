@@ -1,4 +1,7 @@
+from collections.abc import AsyncIterator
+
 import pytest
+from support import Harness
 
 from app.config import Settings
 
@@ -19,3 +22,11 @@ def live_settings() -> Settings:
     if missing := [name for name, value in required.items() if not value]:
         pytest.skip(f"live providers need {', '.join(missing)}")
     return settings
+
+
+@pytest.fixture
+async def harness() -> AsyncIterator[Harness]:
+    h = Harness()
+    yield h
+    for engine in h.engines:
+        await engine.close()

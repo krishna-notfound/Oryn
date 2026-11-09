@@ -16,7 +16,7 @@ from app.main import create_app
 from app.persistence.conversations import InMemoryConversationRepository
 from app.persistence.postgrest import PostgrestClient
 from app.websocket import session as session_module
-from app.websocket.protocol import MAX_AUDIO_FRAME_BYTES, AssistantText, SessionStart
+from app.websocket.protocol import MAX_AUDIO_FRAME_BYTES, SessionStart, TextDelta
 from app.websocket.session import WebSocketEventSink
 
 USER_A = "7b0c3b5e-6a52-4f0e-9a63-0d8f8f1b2c11"
@@ -43,14 +43,17 @@ class RecordingConversation(Conversation):
     async def on_audio(self, chunk: bytes) -> None:
         self.calls.append(("audio", chunk))
 
-    async def on_audio_end(self) -> None:
-        self.calls.append(("audio_end",))
+    async def on_speech_started(self) -> None:
+        self.calls.append(("speech_started",))
+
+    async def on_speech_ended(self) -> None:
+        self.calls.append(("speech_ended",))
 
     async def on_text(self, text: str) -> None:
         self.calls.append(("text", text))
 
-    async def on_interrupt(self) -> None:
-        self.calls.append(("interrupt",))
+    async def on_cancel(self, generation_id: int) -> None:
+        self.calls.append(("cancel", generation_id))
 
     async def on_playback_started(self, generation_id: int) -> None:
         self.calls.append(("playback_started", generation_id))
@@ -83,17 +86,17 @@ class Harness:
 
 
 def start_message(token: str = "token-a", **extra: Any) -> str:
-    return json.dumps({"type": "session.start", "token": token, **extra})
+    return json.dumps({"v": 2, "type": "session.start", "token": token, **extra})
 
 
 def send(ws: WebSocketTestSession, type_: str, **fields: Any) -> None:
-    ws.send_text(json.dumps({"type": type_, **fields}))
+    ws.send_text(json.dumps({"v": 2, "type": type_, **fields}))
 
 
 def sync(ws: WebSocketTestSession) -> None:
-    """Server handles frames in order, so a pong proves earlier frames were routed."""
-    send(ws, "ping")
-    while ws.receive_json()["type"] != "pong":
+    """Server handles frames in order, so a heartbeat reply proves earlier frames were routed."""
+    send(ws, "heartbeat")
+    while ws.receive_json()["type"] != "heartbeat":
         pass
 
 
@@ -132,7 +135,7 @@ def test_invalid_token_closes_with_unauthenticated(harness: Harness) -> None:
     assert harness.conversations == []
 
 
-@pytest.mark.parametrize("first", ["not json", '{"type":"ping"}'])
+@pytest.mark.parametrize("first", ["not json", '{"v":2,"type":"heartbeat"}'])
 def test_first_frame_must_be_session_start(harness: Harness, first: str) -> None:
     with TestClient(harness.app) as client, client.websocket_connect("/ws") as ws:
         ws.send_text(first)
@@ -158,6 +161,8 @@ def test_ready_uses_verified_identity_never_browser_ids(harness: Harness) -> Non
     with TestClient(harness.app) as client:
         with ready_session(client, language="hi-IN") as (ws, ready):
             assert ready["type"] == "session.ready"
+            assert (ready["v"], ready["protocol"], ready["seq"]) == (2, 2, 1)
+            assert ready["session_id"] and ready["ts"] > 0
             assert ready["input_sample_rate"] == 16_000
             assert ready["output_sample_rate"] == Settings().gnani_tts_sample_rate
         conversation = harness.conversations[0]
@@ -184,18 +189,28 @@ def test_every_client_message_reaches_the_matching_method(harness: Harness) -> N
         with ready_session(client) as (ws, _):
             ws.send_bytes(b"\x01\x02")
             send(ws, "user.text", text="namaste")
-            send(ws, "user.interrupt")
-            send(ws, "audio.end")
-            send(ws, "playback.started", generation_id=3)
+            send(ws, "input.speech_started", ts=1)
+            send(ws, "input.speech_ended", ts=2)
+            send(ws, "turn.cancel", generation_id=2)
+            send(ws, "playback.started", generation_id=3, client_latency_ms=40)
             send(ws, "playback.finished", generation_id=3)
+            send(
+                ws,
+                "turn.metrics",
+                turn_id=1,
+                generation_id=3,
+                perceived_ms=1200.0,
+                playback_lead_ms=40.0,
+            )
             sync(ws)
         conversation = harness.conversations[0]
     assert conversation.calls == [
         ("start",),
         ("audio", b"\x01\x02"),
         ("text", "namaste"),
-        ("interrupt",),
-        ("audio_end",),
+        ("speech_started",),
+        ("speech_ended",),
+        ("cancel", 2),
         ("playback_started", 3),
         ("playback_finished", 3),
     ]
@@ -301,7 +316,7 @@ class _BrokenSocket:
 
 async def test_sink_drops_sends_after_the_socket_fails() -> None:
     socket = _BrokenSocket()
-    sink = WebSocketEventSink(socket)  # type: ignore[arg-type]
-    await sink.send_event(AssistantText(generation_id=1, delta="hi"))
-    await sink.send_audio(1, b"\x00")
+    sink = WebSocketEventSink(socket, "s1")  # type: ignore[arg-type]
+    await sink.send_event(TextDelta(generation_id=1, delta="hi"))
+    await sink.send_audio(1, 0, b"\x00")
     assert socket.attempts == 1

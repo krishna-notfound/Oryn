@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Iterable
 
 from app.conversation.prompts import INTERRUPTED_MARKER
+from app.persistence.conversations import StoredMessage
 from app.providers.base import ChatMessage
 
 
@@ -20,6 +22,14 @@ class ConversationHistory:
 
     def add_user(self, text: str) -> None:
         self._messages.append(ChatMessage("user", text))
+
+    def restore(self, stored: Iterable[StoredMessage]) -> None:
+        """Reload messages saved by an earlier connection of the same conversation."""
+        for message in stored:
+            if message.role == "user":
+                self.add_user(message.content)
+            else:
+                self.add_assistant(message.content, interrupted=message.interrupted)
 
     def add_assistant(self, text: str, *, interrupted: bool = False) -> None:
         """`text` must be only what the user actually heard. If they cut Oryn off, a

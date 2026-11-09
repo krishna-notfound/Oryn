@@ -1,32 +1,34 @@
 """VoiceConversation: the orchestrator behind one live conversation.
 
-Flow per turn: final transcript (or typed text) -> memories + crisis check -> context ->
-LLM stream -> sentence segmenter -> TTS (next sentence synthesises while the current one
-streams) -> audio frames tagged with a generation id. A barge-in cancels the turn task,
-fences the generation so no further frame can leave, and tells the browser.
+Flow per turn: browser VAD says the user stopped (`on_speech_ended`) -> Prisma commit ->
+final transcript -> a *speculative* turn starts at once (the LLM does not wait) -> memories +
+crisis check -> context -> LLM -> segmenter -> Timbre -> audio frames tagged with a generation
+id. The first audio is held behind a short gate; if the user speaks again before it opens the
+turn is dropped silently and its words are merged into the next transcript.
 
 Concurrency rules this module relies on:
-  * A turn is one owned asyncio task; it never ends a turn on its own except through
-    `_complete` / `_fail`, which take `self._lock`.
-  * Every send for a turn is guarded by `self._live_generation`. Interrupting clears it
-    *before* anything is awaited, so no frame of the old generation is sent afterwards.
-  * `self._lock` serialises everything that starts or ends a turn (barge-in, new
-    transcript, completion, failure, STT reconnect).
-Spec: docs/context/voice-pipeline.md
+  * `TurnManager` owns the active turn and the generation fence. Cancelling (barge-in,
+    superseding, shutdown) clears the fence synchronously, before any await, so no frame of the
+    old generation can leave afterwards. No lock is held across a provider call.
+  * One turn = one TaskGroup (`TurnPipeline`); STT lives in its own supervised `SttLink`, so a
+    stream reconnect never blocks the WebSocket receive loop or a cancel.
+  * `CancelledError` is never swallowed; broad `except Exception` only where a failure must not
+    take the call down.
+Spec: docs/superpowers/specs/2026-11-09-realtime-pipeline-v2-design.md
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass, field
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from time import perf_counter
 from typing import Literal
 
 from app.config import Settings
 from app.conversation.context import ContextBuilder
 from app.conversation.history import ConversationHistory
+from app.conversation.pipeline import TurnOutbox, TurnPipeline
 from app.conversation.ports import (
     Conversation,
     EventSink,
@@ -35,68 +37,72 @@ from app.conversation.ports import (
     ToolRunner,
     UserContext,
 )
+from app.conversation.streams import closing
+from app.conversation.stt_link import LinkStatus, SttLink
+from app.conversation.turns import Turn, TurnManager
+from app.persistence.conversations import StoredMessage
 from app.providers.base import (
     ChatMessage,
     LanguageModel,
     ProviderError,
     SpeechStarted,
     SpeechToText,
-    SpeechToTextStream,
     STTEvent,
     TextToSpeech,
     ToolCall,
     TranscriptEvent,
 )
 from app.safety.crisis import CrisisDetector
-from app.voice.latency import TurnTimer, latency_stats
-from app.voice.segmenter import SentenceSegmenter
+from app.voice.latency import latency_stats
 from app.voice.state import VoiceState, VoiceStateMachine
 from app.websocket.protocol import (
-    AssistantAudioStart,
-    AssistantDone,
-    AssistantText,
-    ErrorEvent,
-    Interrupted,
+    LlmStarted,
+    PipelineError,
     ServerEvent,
     StateChanged,
     TranscriptFinal,
-    TranscriptPartial,
+    TurnCancelled,
+    TurnCompleted,
 )
 
 log = logging.getLogger(__name__)
 
 MEMORY_BUDGET_S = 0.15  # recall is a bonus; never let it hold up the reply
-MAX_SYNTHESES_IN_FLIGHT = 2  # the sentence being played and the one being prefetched
-SYNTHESIS_BUFFER_CHUNKS = 8
 TOOL_TIMEOUT_S = 8.0
 HOOK_GRACE_S = 2.0  # how long close() lets persistence hooks finish before cancelling them
+HISTORY_LOAD_TIMEOUT_S = 1.5
+RESUMED_HOLD_S = 1.5  # words kept for a continuation that never produces a transcript
 
 MessageHook = Callable[[str, str, bool], Awaitable[None]]
 AfterTurnHook = Callable[[UserContext, list[ChatMessage]], Awaitable[None]]
-_AudioChunks = asyncio.Queue[bytes | None]
+HistoryLoader = Callable[[], Awaitable[Sequence[StoredMessage]]]
 
 
-@dataclass(slots=True)
-class _Turn:
-    """Everything one user utterance and Oryn's reply to it need to share."""
+class _TurnOutput:
+    """The pipeline's way out: every send is checked against the generation fence."""
 
-    turn_id: int
-    generation_id: int
-    user_text: str
-    timer: TurnTimer
-    task: asyncio.Task[None] = field(init=False)
-    reply: str = ""
-    done: bool = False  # all text generated and all audio sent
-    # voice pipeline: sentences in speaking order, each with its audio buffer
-    playlist: asyncio.Queue[tuple[str, _AudioChunks] | None] = field(default_factory=asyncio.Queue)
-    slots: asyncio.Semaphore = field(
-        default_factory=lambda: asyncio.Semaphore(MAX_SYNTHESES_IN_FLIGHT)
-    )
-    audio_started: bool = False
-    audio_bytes: int = 0
-    audio_sent_at: float | None = None
-    playback_at: float | None = None  # when the browser said audio became audible
-    sentence_ends: list[tuple[str, float]] = field(default_factory=list)  # (text, audio secs)
+    def __init__(self, sink: EventSink, state: VoiceStateMachine, turns: TurnManager) -> None:
+        self._sink = sink
+        self._state = state
+        self._turns = turns
+
+    async def event(self, turn: Turn, event: ServerEvent) -> None:
+        if self._live(turn):
+            stamped = event.model_copy(
+                update={"turn_id": turn.turn_id, "generation_id": turn.generation_id}
+            )
+            await self._sink.send_event(stamped)
+
+    async def state(self, turn: Turn, state: VoiceState) -> None:
+        if self._live(turn):
+            await self._state.transition(state)
+
+    async def audio(self, turn: Turn, seq: int, pcm: bytes) -> None:
+        if self._live(turn):
+            await self._sink.send_audio(turn.generation_id, seq, pcm)
+
+    def _live(self, turn: Turn) -> bool:
+        return self._turns.live_generation == turn.generation_id
 
 
 class VoiceConversation(Conversation):
@@ -114,18 +120,18 @@ class VoiceConversation(Conversation):
         tools: ToolRunner | None = None,
         after_turn: AfterTurnHook | None = None,
         on_message: MessageHook | None = None,
+        load_history: HistoryLoader | None = None,
     ) -> None:
         self._user = user
         self._mode = mode
-        self._stt = stt
         self._llm = llm
-        self._tts = tts
         self._sink = sink
         self._settings = settings
         self._memory = memory
         self._tools = tools
         self._after_turn = after_turn
         self._on_message = on_message
+        self._load_history = load_history
 
         self._state = VoiceStateMachine(self._announce)
         self._history = ConversationHistory(settings.context_max_turns)
@@ -134,14 +140,27 @@ class VoiceConversation(Conversation):
         fmt = tts.output_format
         self._bytes_per_second = fmt.sample_rate * fmt.channels * 2
 
-        self._lock = asyncio.Lock()
-        self._stream: SpeechToTextStream | None = None
-        self._reader: asyncio.Task[None] | None = None
-        self._turn: _Turn | None = None
-        self._live_generation: int | None = None
-        self._turn_count = 0
-        self._generation_count = 0
+        self._turns = TurnManager(self._run_turn, self._on_turn_cancelled)
+        self._output = _TurnOutput(sink, self._state, self._turns)
+        self._pipeline = TurnPipeline(
+            self._output,
+            tts if mode == "voice" else None,
+            language=user.language,
+            voice=settings.gnani_tts_voice or None,
+        )
+        self._link: SttLink | None = (
+            SttLink(stt, user.language, on_event=self._on_stt_event, on_status=self._on_link_status)
+            if mode == "voice"
+            else None
+        )
+
+        # What the browser's VAD and the provider have told us about the user's speech.
+        self._user_speaking = False
+        self._awaiting_final = False  # commit sent, transcript not back yet
         self._speech_end: float | None = None
+        self._commit_sent: float | None = None
+        self._prefix = ""  # words of a speculative turn dropped because the user kept talking
+        self._prefix_task: asyncio.Task[None] | None = None
         self._background: set[asyncio.Task[None]] = set()
         self._closed = False
 
@@ -149,203 +168,258 @@ class VoiceConversation(Conversation):
 
     async def start(self) -> None:
         await self._state.transition(VoiceState.LISTENING)
-        if self._mode == "voice":
-            await self._open_stream()
+        restore = asyncio.create_task(self._restore_history(), name="history-restore")
+        try:  # reconnecting to a conversation: the history loads while the STT socket opens
+            if self._link is not None:
+                await self._link.start()
+            await restore
+        finally:
+            restore.cancel()
+            await asyncio.wait({restore})
 
     async def on_audio(self, chunk: bytes) -> None:
-        if self._mode != "voice" or self._state.state in _DEAF_STATES:
-            return
-        self._speech_end = None  # new audio: an earlier `audio.end` no longer belongs to a turn
-        try:
-            stream = self._stream or await self._open_stream()
-            await stream.send_audio(chunk)
-        except ProviderError as exc:
-            await self._on_stt_error(self._stream, exc)
+        if self._link is not None and self._state.state not in _DEAF_STATES:
+            self._link.push_audio(chunk)
 
-    async def on_audio_end(self) -> None:
-        self._speech_end = perf_counter()
-        if (stream := self._stream) is None:
+    async def on_speech_started(self) -> None:
+        self._user_speaking = True
+        self._speech_end = self._commit_sent = None
+        self._awaiting_final = False
+        self._cancel_prefix_flush()
+        await self._interrupt("barge_in")
+
+    async def on_speech_ended(self) -> None:
+        if self._link is None:
             return
-        try:
-            await stream.finish()
-        except ProviderError as exc:
-            await self._on_stt_error(stream, exc)
+        self._user_speaking = False
+        self._speech_end = perf_counter()
+        self._awaiting_final = True
+        self._link.commit()
+        self._commit_sent = perf_counter()
+        if self._prefix:  # the continuation is over; give its transcript a moment to arrive
+            self._schedule_prefix_flush()
 
     async def on_text(self, text: str) -> None:
-        if text.strip():
-            await self._begin_turn(text.strip(), language=None, announce=False)
+        if text := text.strip():
+            self._prefix = ""
+            self._cancel_prefix_flush()
+            await self._start_turn(text, speculative=False, from_voice=False)
 
-    async def on_interrupt(self) -> None:
-        async with self._lock:
-            await self._stop_locked(notify=True)
+    async def on_cancel(self, generation_id: int) -> None:
+        await self._turns.cancel("client_cancel", generation_id)
 
     async def on_playback_started(self, generation_id: int) -> None:
-        turn = self._turn
+        turn = self._turns.current
         if turn and turn.generation_id == generation_id and turn.playback_at is None:
             turn.playback_at = perf_counter()
             turn.timer.mark("playback_started")
 
     async def on_playback_finished(self, generation_id: int) -> None:
-        # Before assistant.done the browser's queue may just be momentarily empty.
-        turn = self._turn
-        if turn and turn.generation_id == generation_id and turn.done:
-            await self._complete(turn)
+        turn = self._turns.current
+        if turn and turn.generation_id == generation_id:
+            turn.playback_finished = True  # may arrive before the reply is fully generated
+            if turn.generated:
+                await self._complete(turn)
 
     async def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        if self._reader is not None:
-            self._reader.cancel()
-            await asyncio.wait({self._reader})
-        async with self._lock:
-            await self._stop_locked(notify=False)
+        self._cancel_prefix_flush()
+        if self._link is not None:
+            await self._link.close()
+        await self._turns.close()
         if self._background:
             _, pending = await asyncio.wait(self._background, timeout=HOOK_GRACE_S)
             for task in pending:
                 task.cancel()
             if pending:
                 await asyncio.wait(pending)
-        if self._stream is not None:
-            await self._close_stream(self._stream)
-            self._stream = None
         await self._state.transition(VoiceState.IDLE)
 
-    # ------------------------------------------------------------ speech-to-text
+    # ------------------------------------------------------------ history
 
-    async def _open_stream(self) -> SpeechToTextStream:
-        stream = await self._stt.open_stream(self._user.language)
-        self._stream = stream
-        self._reader = asyncio.create_task(self._read_stt(stream), name="stt-reader")
-        return stream
-
-    async def _read_stt(self, stream: SpeechToTextStream) -> None:
-        try:
-            async for event in stream.events():
-                await self._on_stt_event(event)
-        except ProviderError as exc:
-            await self._on_stt_error(stream, exc)
+    async def _restore_history(self) -> None:
+        """Bring back what an earlier connection of this conversation already said."""
+        if self._load_history is None or not self._user.save_history:
             return
-        if self._stream is stream:  # ended after finish(); the next audio opens a fresh one
-            self._stream = None
-        await self._close_stream(stream)
+        try:
+            async with asyncio.timeout(HISTORY_LOAD_TIMEOUT_S):
+                stored = await self._load_history()
+        except Exception:  # history is a convenience; the call goes on without it
+            log.warning("history not restored", exc_info=True)
+            return
+        self._history.restore(stored)
+        self._turns.resume_numbering(sum(1 for m in stored if m.role == "user"))
+
+    # ------------------------------------------------------------ speech-to-text
 
     async def _on_stt_event(self, event: STTEvent) -> None:
         match event:
             case SpeechStarted():
-                if self._state.state in (VoiceState.GENERATING, VoiceState.SPEAKING):
-                    async with self._lock:
-                        await self._stop_locked(notify=True)
-            case TranscriptEvent(is_final=False) if event.text.strip():
-                await self._sink.send_event(TranscriptPartial(text=event.text))
-            case TranscriptEvent(is_final=True) if event.text.strip():
-                await self._begin_turn(event.text.strip(), language=event.language, announce=True)
+                if not self._awaiting_final:  # else it is the utterance we just committed
+                    await self._interrupt("barge_in")
+            case TranscriptEvent(is_final=True):
+                self._awaiting_final = False
+                if event.text.strip():
+                    await self._on_final(event.text.strip(), event.language)
 
-    async def _on_stt_error(self, stream: SpeechToTextStream | None, exc: ProviderError) -> None:
-        """Retryable: reopen the stream once. Otherwise (or if that fails) the session is
-        ERROR. Holds the lock during the reopen so no turn starts on a half-open stream."""
-        async with self._lock:
-            if self._closed or stream is not self._stream:
-                return  # already handled by the reader or the audio path
-            self._stream = None
-            log.warning("stt failed", extra={"provider": exc.provider, "retryable": exc.retryable})
-            await self._send_error("stt_error", f"{exc.provider} failed", exc.retryable)
-            if stream is not None:
-                await self._close_stream(stream)
-            if not exc.retryable:
-                await self._enter_error_locked()
-                return
-            reconnecting = self._state.state is VoiceState.LISTENING
-            if reconnecting:
-                await self._state.transition(VoiceState.RECONNECTING)
-            try:
-                await self._open_stream()
-            except ProviderError as retry_exc:
-                await self._send_error("stt_error", f"{retry_exc.provider} failed", False)
-                await self._enter_error_locked()
-                return
-            if reconnecting:
-                await self._state.transition(VoiceState.LISTENING)
+    async def _on_link_status(self, status: LinkStatus, error: ProviderError | None) -> None:
+        self._awaiting_final = False
+        match status:
+            case LinkStatus.RECONNECTING:
+                await self._send_error("stt_error", _provider_message(error), retryable=True)
+                if self._state.state is VoiceState.LISTENING:
+                    await self._state.transition(VoiceState.RECONNECTING)
+            case LinkStatus.RESTORED:
+                if self._state.state is VoiceState.RECONNECTING:
+                    await self._state.transition(VoiceState.LISTENING)
+            case LinkStatus.FAILED:
+                await self._send_error("stt_error", _provider_message(error), retryable=False)
+                await self._turns.cancel("stt_error")
+                await self._state.transition(VoiceState.ERROR)
 
-    async def _enter_error_locked(self) -> None:
-        await self._stop_locked(notify=True)
-        await self._state.transition(VoiceState.ERROR)
+    async def _on_final(self, text: str, language: str | None) -> None:
+        arrived = perf_counter()
+        current = self._turns.current
+        if current is not None and current.speculative:
+            # The user paused and went on: one utterance, not two.
+            self._prefix = current.user_text
+            await self._turns.cancel("merged", current.generation_id)
+        text = self._merge_prefix(text)
+        if self._user_speaking:  # talking again already: wait for the rest
+            self._stash(text)
+            return
+        await self._start_turn(
+            text,
+            speculative=self._speech_end is None,  # no client VAD verdict: hold the audio briefly
+            from_voice=True,
+            language=language,
+            arrived=arrived,
+        )
 
-    @staticmethod
-    async def _close_stream(stream: SpeechToTextStream) -> None:
+    # ------------------------------------------------------------ speculative-turn bookkeeping
+
+    async def _interrupt(self, reason: str) -> None:
+        """The user is speaking over a turn. An unconfirmed one made no sound yet: drop it
+        silently and keep its words; a confirmed one is a barge-in."""
+        turn = self._turns.current
+        if turn is None:
+            return
+        if turn.speculative:
+            self._prefix = turn.user_text
+            reason = "speech_resumed"
+        await self._turns.cancel(reason, turn.generation_id)
+
+    def _merge_prefix(self, text: str) -> str:
+        if self._prefix:
+            text = f"{self._prefix} {text}"
+            self._prefix = ""
+        self._cancel_prefix_flush()
+        return text
+
+    def _stash(self, text: str) -> None:
+        self._prefix = text
+        self._schedule_prefix_flush()
+
+    def _schedule_prefix_flush(self) -> None:
+        self._cancel_prefix_flush()
+        self._prefix_task = asyncio.create_task(self._flush_prefix(), name="prefix-flush")
+
+    def _cancel_prefix_flush(self) -> None:
+        task = self._prefix_task
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            self._prefix_task = None
+
+    async def _flush_prefix(self) -> None:
         try:
-            await stream.close()
-        except Exception:
-            log.exception("closing stt stream failed")
+            await asyncio.sleep(RESUMED_HOLD_S)
+            text, self._prefix = self._prefix, ""
+            if text:
+                await self._start_turn(text, speculative=False, from_voice=True)
+        finally:
+            if self._prefix_task is asyncio.current_task():
+                self._prefix_task = None
 
     # ------------------------------------------------------------ turn lifecycle
 
-    async def _begin_turn(self, text: str, *, language: str | None, announce: bool) -> None:
-        async with self._lock:
-            await self._stop_locked(notify=True)  # a new utterance replaces any reply in flight
-            if self._state.state is not VoiceState.LISTENING:
-                log.info("input ignored", extra={"state": self._state.state})
-                return
-            self._turn_count += 1
-            self._generation_count += 1
-            timer = TurnTimer()
-            timer.mark("stt_final")
-            if self._speech_end is not None:
-                timer.mark("speech_end", self._speech_end)
-                self._speech_end = None
-            turn = _Turn(self._turn_count, self._generation_count, text, timer)
-            if announce:
-                await self._sink.send_event(
-                    TranscriptFinal(turn_id=turn.turn_id, text=text, language=language)
-                )
-            self._turn = turn
-            self._live_generation = turn.generation_id
-            await self._state.transition(VoiceState.PROCESSING)
-            turn.task = asyncio.create_task(self._run_turn(turn), name=f"turn-{turn.turn_id}")
-            log.info("turn started", extra={"turn_id": turn.turn_id, "chars": len(text)})
-
-    async def _stop_locked(self, *, notify: bool) -> None:
-        """Barge-in / teardown. Idempotent: with no turn in flight it does nothing."""
-        turn = self._turn
-        if turn is None:
+    async def _start_turn(
+        self,
+        text: str,
+        *,
+        speculative: bool,
+        from_voice: bool,
+        language: str | None = None,
+        arrived: float | None = None,
+    ) -> None:
+        if self._closed:
             return
-        self._turn = None
-        self._live_generation = None  # fence: nothing for this generation is sent after here
-        turn.timer.mark("interrupt")
-        turn.task.cancel()
-        try:
-            if notify:
-                await self._state.transition(VoiceState.INTERRUPTED)
-                await self._sink.send_event(Interrupted(generation_id=turn.generation_id))
-        finally:  # a dead sink must not leave the cancelled task un-awaited
-            await asyncio.wait({turn.task})
-        turn.timer.mark("stop_complete")
-        await self._finalize(turn, *self._heard(turn))
-        if notify:
-            await self._state.transition(VoiceState.LISTENING)
+        await self._turns.cancel("superseded")  # a new utterance replaces any reply in flight
+        if self._state.state is not VoiceState.LISTENING:
+            log.info("input ignored", extra={"state": self._state.state})
+            return
+        turn = await self._turns.begin(
+            text,
+            speculative=speculative,
+            grace_s=self._settings.endpoint_grace_ms / 1000,
+            language=language,
+            from_voice=from_voice,
+        )
+        if from_voice:
+            turn.timer.mark("stt_final", arrived)
+            if self._speech_end is not None:
+                turn.timer.mark("speech_end", self._speech_end)
+            if self._commit_sent is not None:
+                turn.timer.mark("commit_sent", self._commit_sent)
+        self._speech_end = self._commit_sent = None
+        log.info("turn started", extra={"turn_id": turn.turn_id, "chars": len(text)})
 
-    async def _complete(self, turn: _Turn) -> None:
-        async with self._lock:
-            if self._turn is not turn:
-                return  # interrupted first
-            self._turn = None
-            self._live_generation = None
+    async def _on_turn_cancelled(self, turn: Turn, reason: str) -> None:
+        """Called once the cancelled turn's tasks are gone."""
+        if turn.speculative:
+            return  # never confirmed: the browser saw nothing, the caller keeps the words
+        await self._end_interrupted(turn, reason)
+
+    async def _complete(self, turn: Turn) -> None:
+        async with self._turns.ending(turn) as owned:
+            if not owned:
+                return  # cancelled first
             await self._finalize(turn, turn.reply.strip(), interrupted=False)
-            await self._state.transition(VoiceState.LISTENING)
+            await self._enter_listening()
 
-    async def _fail(self, turn: _Turn, code: str, message: str, retryable: bool) -> None:
-        async with self._lock:
-            if self._turn is not turn:
+    async def _fail(self, turn: Turn, code: str, message: str, retryable: bool) -> None:
+        await turn.confirmed.wait()  # a speculative turn reports nothing the user did not hear
+        async with self._turns.ending(turn) as owned:
+            if not owned:
                 return
-            self._turn = None
-            self._live_generation = None
-            await self._send_error(code, message, retryable)
-            await self._finalize(turn, *self._heard(turn))
-            # The turn is aborted, not the session: INTERRUPTED -> LISTENING is the way back.
+            await self._send_error(code, message, retryable, turn)
+            await self._end_interrupted(turn, "error")
+
+    async def _end_interrupted(self, turn: Turn, reason: str) -> None:
+        """INTERRUPTED -> `turn.cancelled` -> history + metrics -> LISTENING. The browser is only
+        told if it was told the turn had started."""
+        heard, cut_short = self._heard(turn)
+        announced = not self._closed and self._state.state in _TURN_STATES
+        if announced:
             await self._state.transition(VoiceState.INTERRUPTED)
+            await self._send(
+                TurnCancelled(
+                    turn_id=turn.turn_id,
+                    generation_id=turn.generation_id,
+                    reason=reason,
+                    heard_text=heard,
+                )
+            )
+        await self._finalize(turn, heard, cut_short)
+        if announced:
+            await self._enter_listening()
+
+    async def _enter_listening(self) -> None:
+        if self._state.state in (VoiceState.INTERRUPTED, *_TURN_STATES):
             await self._state.transition(VoiceState.LISTENING)
 
-    def _heard(self, turn: _Turn) -> tuple[str, bool]:
+    def _heard(self, turn: Turn) -> tuple[str, bool]:
         """What the user actually received, and whether the reply was cut short. For
         voice, the browser's playback start plus the audio duration we sent tells which
         sentences finished playing; the rest never reached their ears."""
@@ -356,13 +430,13 @@ class VoiceConversation(Conversation):
         if started is None:
             return "", True
         elapsed = perf_counter() - started
-        if turn.done and elapsed >= turn.audio_bytes / self._bytes_per_second:
+        if turn.generated and elapsed >= turn.audio_bytes / self._bytes_per_second:
             return full, False
         return " ".join(text for text, end in turn.sentence_ends if end <= elapsed), True
 
-    async def _finalize(self, turn: _Turn, heard: str, interrupted: bool) -> None:
-        """Commit the exchange to history, hand it to the hooks, emit metrics. Runs once
-        per turn, under the lock, and never waits for the hooks."""
+    async def _finalize(self, turn: Turn, heard: str, interrupted: bool) -> None:
+        """Commit the exchange to history, hand it to the hooks, emit metrics. Runs once per
+        turn and never waits for the hooks."""
         self._history.add_user(turn.user_text)
         self._history.add_assistant(heard, interrupted=interrupted)
         if self._on_message is not None:
@@ -376,11 +450,10 @@ class VoiceConversation(Conversation):
             extra={
                 "turn_id": turn.turn_id,
                 "interrupted": interrupted,
-                "metrics": metrics.model_dump(),
+                "metrics": metrics.model_dump(exclude_none=True),
             },
         )
-        if not self._closed:
-            await self._sink.send_event(metrics)
+        await self._send(metrics)
 
     async def _persist(self, user_text: str, heard: str, interrupted: bool) -> None:
         assert self._on_message is not None
@@ -402,24 +475,40 @@ class VoiceConversation(Conversation):
 
     # ------------------------------------------------------------ the turn itself
 
-    async def _run_turn(self, turn: _Turn) -> None:
+    async def _run_turn(self, turn: Turn) -> None:
+        outbox = TurnOutbox()
+        if turn.from_voice:
+            outbox.event(TranscriptFinal(text=turn.user_text, language=turn.language))
+        outbox.state(VoiceState.PROCESSING)
         failure: tuple[str, str, bool] | None = None
         try:
-            await self._respond(turn)
+            await self._pipeline.run(turn, self._reply(turn, outbox), outbox)
         except* ProviderError as group:
             exc = group.exceptions[0]
-            assert isinstance(exc, ProviderError)  # one task group, so never nested
+            assert isinstance(exc, ProviderError)
             log.warning(
                 "provider failed", extra={"provider": exc.provider, "turn_id": turn.turn_id}
             )
-            failure = ("provider_error", f"{exc.provider} failed", exc.retryable)
+            failure = ("provider_error", _provider_message(exc), exc.retryable)
         except* Exception:
             log.exception("turn crashed", extra={"turn_id": turn.turn_id})
             failure = ("internal_error", "Something went wrong", False)
         if failure is not None:
             await self._fail(turn, *failure)
+            return
+        await self._finish_generation(turn)
 
-    async def _respond(self, turn: _Turn) -> None:
+    async def _finish_generation(self, turn: Turn) -> None:
+        """All text produced and all audio sent. Done now if there is nothing left to play,
+        else when the browser reports it finished playing."""
+        await self._output.event(turn, TurnCompleted(text=turn.reply.strip()))
+        turn.generated = True
+        if not turn.audio_started or turn.playback_finished:
+            await self._complete(turn)
+
+    async def _reply(self, turn: Turn, outbox: TurnOutbox) -> AsyncGenerator[str, None]:
+        """The reply's text deltas. Everything before the first token - memories, context -
+        happens here, then the browser is told generation started."""
         memories = await self._recall(turn.user_text)
         safety_note = self._crisis.check(turn.user_text)
         if safety_note:
@@ -427,30 +516,12 @@ class VoiceConversation(Conversation):
         messages = self._context.build(
             self._user, self._history, memories, turn.user_text, safety_note
         )
-        await self._enter(turn, VoiceState.GENERATING)
+        outbox.state(VoiceState.GENERATING)
+        outbox.event(LlmStarted())
         turn.timer.mark("llm_request")
-
-        speaking = self._mode == "voice"
-        segmenter = SentenceSegmenter()
-        async with asyncio.TaskGroup() as tasks:
-            if speaking:
-                tasks.create_task(self._play(turn))
-            async for delta in self._llm_text(turn, messages):
-                turn.reply += delta
-                await self._send(turn, AssistantText(generation_id=turn.generation_id, delta=delta))
-                for sentence in segmenter.feed(delta) if speaking else ():
-                    self._say(tasks, turn, sentence)
-            if speaking:
-                if rest := segmenter.flush():
-                    self._say(tasks, turn, rest)
-                turn.playlist.put_nowait(None)
-        # the task group has exited: all audio is out
-        await self._send(
-            turn, AssistantDone(generation_id=turn.generation_id, text=turn.reply.strip())
-        )
-        turn.done = True
-        if not turn.audio_started:  # text mode, or nothing speakable: no playback to wait for
-            await self._complete(turn)
+        async with closing(self._llm_text(turn, messages)) as deltas:
+            async for delta in deltas:
+                yield delta
 
     async def _recall(self, query: str) -> list[Memory]:
         if self._memory is None or not self._user.memory_enabled:
@@ -464,7 +535,7 @@ class VoiceConversation(Conversation):
             log.exception("memory recall failed")
         return []
 
-    async def _llm_text(self, turn: _Turn, messages: list[ChatMessage]) -> AsyncIterator[str]:
+    async def _llm_text(self, turn: Turn, messages: list[ChatMessage]) -> AsyncIterator[str]:
         """Yield the reply's text deltas, running the tool loop (bounded per turn) between
         LLM rounds. Tool calls and results stay in `messages`; they are never spoken."""
         tools_used = 0
@@ -473,12 +544,15 @@ class VoiceConversation(Conversation):
             tools = self._tools if tools_used < limit else None
             text: list[str] = []
             calls: list[ToolCall] = []
-            async for chunk in self._llm.stream(messages, tools.specs() if tools else []):
-                if chunk.text:
-                    turn.timer.mark("llm_first_token")
-                    text.append(chunk.text)
-                    yield chunk.text
-                calls.extend(chunk.tool_calls)
+            async with closing(
+                self._llm.stream(messages, tools.specs() if tools else [])
+            ) as chunks:
+                async for chunk in chunks:
+                    if chunk.text:
+                        turn.timer.mark("llm_first_token")
+                        text.append(chunk.text)
+                        yield chunk.text
+                    calls.extend(chunk.tool_calls)
             if tools is None or not calls:
                 return
             calls = calls[: limit - tools_used]
@@ -496,65 +570,33 @@ class VoiceConversation(Conversation):
             log.warning("tool timed out", extra={"tool": call.name})
             return f"Error: {call.name} timed out."
 
-    # ------------------------------------------------------------ text-to-speech pipeline
-
-    def _say(self, tasks: asyncio.TaskGroup, turn: _Turn, sentence: str) -> None:
-        """Start synthesising `sentence` now; `_play` emits it in order."""
-        chunks: _AudioChunks = asyncio.Queue(maxsize=SYNTHESIS_BUFFER_CHUNKS)
-        turn.playlist.put_nowait((sentence, chunks))
-        tasks.create_task(self._synthesize(turn, sentence, chunks))
-
-    async def _synthesize(self, turn: _Turn, sentence: str, chunks: _AudioChunks) -> None:
-        await turn.slots.acquire()  # released by _play once this sentence has been sent
-        turn.timer.mark("tts_request")
-        voice = self._settings.gnani_tts_voice or None
-        async for pcm in self._tts.synthesize(sentence, language=self._user.language, voice=voice):
-            turn.timer.mark("tts_first_byte")
-            await chunks.put(pcm)
-        await chunks.put(None)
-
-    async def _play(self, turn: _Turn) -> None:
-        """Send audio strictly in sentence order, whatever order syntheses finish in."""
-        while (item := await turn.playlist.get()) is not None:
-            sentence, chunks = item
-            while (pcm := await chunks.get()) is not None:
-                if not pcm:
-                    continue
-                if not turn.audio_started:
-                    turn.audio_started = True
-                    start = AssistantAudioStart(
-                        generation_id=turn.generation_id,
-                        sample_rate=self._tts.output_format.sample_rate,
-                    )
-                    await self._send(turn, start)
-                    await self._enter(turn, VoiceState.SPEAKING)
-                await self._send_audio(turn, pcm)
-                turn.audio_bytes += len(pcm)
-                turn.audio_sent_at = turn.audio_sent_at or perf_counter()
-                turn.timer.mark("first_audio_sent")
-            turn.sentence_ends.append((sentence, turn.audio_bytes / self._bytes_per_second))
-            turn.slots.release()
-
-    # ------------------------------------------------------------ guarded output
+    # ------------------------------------------------------------ output
 
     async def _announce(self, state: VoiceState) -> None:
         if not self._closed:
             await self._sink.send_event(StateChanged(state=state))
 
-    async def _enter(self, turn: _Turn, state: VoiceState) -> None:
-        if self._live_generation == turn.generation_id:
-            await self._state.transition(state)
-
-    async def _send(self, turn: _Turn, event: ServerEvent) -> None:
-        if self._live_generation == turn.generation_id:
+    async def _send(self, event: ServerEvent) -> None:
+        if not self._closed:
             await self._sink.send_event(event)
 
-    async def _send_audio(self, turn: _Turn, pcm: bytes) -> None:
-        if self._live_generation == turn.generation_id:
-            await self._sink.send_audio(turn.generation_id, pcm)
-
-    async def _send_error(self, code: str, message: str, retryable: bool) -> None:
-        await self._sink.send_event(ErrorEvent(code=code, message=message, retryable=retryable))
+    async def _send_error(
+        self, code: str, message: str, retryable: bool, turn: Turn | None = None
+    ) -> None:
+        await self._send(
+            PipelineError(
+                turn_id=turn.turn_id if turn else None,
+                generation_id=turn.generation_id if turn else None,
+                code=code,
+                message=message,
+                retryable=retryable,
+            )
+        )
 
 
 _DEAF_STATES = frozenset({VoiceState.IDLE, VoiceState.RECONNECTING, VoiceState.ERROR})
+_TURN_STATES = frozenset({VoiceState.PROCESSING, VoiceState.GENERATING, VoiceState.SPEAKING})
+
+
+def _provider_message(error: ProviderError | None) -> str:
+    return f"{error.provider} failed" if error else "speech service failed"
