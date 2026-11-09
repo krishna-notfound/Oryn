@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -34,6 +35,9 @@ CONNECT_TIMEOUT_S = 5.0  # the upgrade alone takes 2-3 s
 MAX_IDLE_TIMEOUT_S = 900
 ERROR_CLOSE_GRACE_S = 1.0  # Prisma sends `error` then closes; wait briefly for the close code
 _ABNORMAL_CLOSE = 1006
+EVENT_QUEUE_SIZE = 64  # one item per VAD segment; a consumer that falls this far behind is stuck
+
+log = logging.getLogger(__name__)
 
 
 class FrameChunker:
@@ -74,8 +78,9 @@ class GnaniPrismaSTTStream(SpeechToTextStream):
     def __init__(self, ws: ClientConnection) -> None:
         self._ws = ws
         self._chunker = FrameChunker()
-        # One item per VAD segment, so volume is tiny; unbounded keeps close() sentinel-safe.
-        self._events: asyncio.Queue[STTEvent | ProviderError | None] = asyncio.Queue()
+        self._events: asyncio.Queue[STTEvent | ProviderError | None] = asyncio.Queue(
+            EVENT_QUEUE_SIZE
+        )
         self._failure: ProviderError | None = None
         self._closed = False
         self._reader = asyncio.create_task(self._read(), name="prisma-reader")
@@ -85,6 +90,8 @@ class GnaniPrismaSTTStream(SpeechToTextStream):
             await self._send(frame)
 
     async def finish(self) -> None:
+        """Flush the audio still buffered and send `commit`: Prisma closes the open utterance
+        at once instead of waiting for its own silence window."""
         if (tail := self._chunker.flush()) is not None:
             await self._send(tail)
         await self._send(json.dumps({"type": "commit"}))
@@ -100,10 +107,22 @@ class GnaniPrismaSTTStream(SpeechToTextStream):
             return
         self._closed = True
         self._reader.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self._reader
-        await self._ws.close()
-        self._events.put_nowait(None)
+        try:
+            # asyncio.wait, not `await reader` under suppress(CancelledError): that would also
+            # swallow the cancellation of whoever is closing us.
+            await asyncio.wait({self._reader})
+        finally:
+            await self._ws.close()
+            self._end_events()
+
+    def _end_events(self) -> None:
+        """Terminate `events()` even if its consumer left the queue full."""
+        while True:
+            try:
+                self._events.put_nowait(None)
+                return
+            except asyncio.QueueFull:
+                self._events.get_nowait()
 
     async def _send(self, message: bytes | str) -> None:
         try:
@@ -122,21 +141,27 @@ class GnaniPrismaSTTStream(SpeechToTextStream):
         server_message: str | None = None
         try:
             async for raw in self._ws:
-                if isinstance(raw, str) and (message := json.loads(raw)):
+                message = json.loads(raw) if isinstance(raw, str) else None
+                if isinstance(message, dict):
                     if (event := self._to_event(message)) is not None:
-                        self._events.put_nowait(event)
+                        await self._events.put(event)
                     elif message.get("type") == "error":
                         server_message = str(message.get("message", "unknown error"))
                         with contextlib.suppress(TimeoutError):
                             await asyncio.wait_for(self._ws.wait_closed(), ERROR_CLOSE_GRACE_S)
                         break
-            self._finish_with(
+            await self._finish_with(
                 close_error(self._ws.close_code, self._ws.close_reason or "", server_message)
             )
         except ConnectionClosed as exc:
-            self._finish_with(self._error_from(exc, server_message))
+            await self._finish_with(self._error_from(exc, server_message))
         except json.JSONDecodeError as exc:
-            self._finish_with(ProviderError(NAME, f"malformed message: {exc}", retryable=True))
+            await self._finish_with(
+                ProviderError(NAME, f"malformed message: {exc}", retryable=True)
+            )
+        except Exception as exc:  # a reader that dies silently would leave the call deaf
+            log.exception("prisma reader crashed")
+            await self._finish_with(ProviderError(NAME, f"reader failed: {exc}", retryable=True))
 
     @staticmethod
     def _to_event(message: dict[str, Any]) -> STTEvent | None:
@@ -152,11 +177,11 @@ class GnaniPrismaSTTStream(SpeechToTextStream):
             case _:  # connected / processing / settings_updated carry nothing we need
                 return None
 
-    def _finish_with(self, error: ProviderError | None) -> None:
+    async def _finish_with(self, error: ProviderError | None) -> None:
         self._failure = error
         if error is not None:
-            self._events.put_nowait(error)
-        self._events.put_nowait(None)
+            await self._events.put(error)
+        await self._events.put(None)
 
 
 class GnaniPrismaSTT(SpeechToText):
