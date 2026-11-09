@@ -81,7 +81,7 @@ export class RealtimeClient {
     return this.send({ type: "user.text", text });
   }
 
-  /** Client VAD edges; `at` is epoch ms. */
+  /** Client VAD edges, epoch ms. For `speechEnded` pass the last voiced frame, not the emission time. */
   speechStarted(at: number): void {
     this.send({ type: "input.speech_started", ts: Math.round(at) });
   }

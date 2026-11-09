@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { VadCore, type VadEvent } from "../lib/audio/vadCore";
+import { perfToEpochMs, VadCore, type VadEvent } from "../lib/audio/vadCore";
 
 const FRAME = 20;
 const SPEECH = 0.12;
@@ -61,6 +61,37 @@ describe("VadCore", () => {
     assert.equal(end.type, "speechEnded");
     assert.equal((end as { misfire: boolean }).misfire, false);
     assert.equal(vad.isSpeaking, false);
+  });
+
+  it("reports the last voiced frame, so the 250 ms hangover is separable from the true end", () => {
+    const vad = new VadCore();
+    const talk = feed(vad, 0, 600, SPEECH); // last voiced frame at t = 580
+    const quiet = feed(vad, talk.t, 400, QUIET);
+    const end = quiet.events[0] as { endedAt: number; lastVoicedAt: number };
+    assert.equal(end.lastVoicedAt, 580);
+    assert.ok(end.endedAt - end.lastVoicedAt >= 250);
+    assert.ok(end.endedAt - end.lastVoicedAt < 250 + 20);
+  });
+
+  it("perceived latency counted from lastVoicedAt includes the hangover", () => {
+    const vad = new VadCore();
+    const talk = feed(vad, 0, 600, SPEECH);
+    const quiet = feed(vad, talk.t, 400, QUIET);
+    const end = quiet.events[0] as { endedAt: number; lastVoicedAt: number };
+    const firstAudibleAt = end.endedAt + 900; // 900 ms of server + playback after the emission
+    assert.ok(firstAudibleAt - end.lastVoicedAt >= 900 + 250);
+  });
+
+  it("flush reports the last voiced frame too", () => {
+    const vad = new VadCore();
+    feed(vad, 0, 400, SPEECH);
+    const end = vad.flush(500);
+    assert.equal(end?.lastVoicedAt, 380);
+    assert.equal(end?.endedAt, 500);
+  });
+
+  it("converts perf timestamps to epoch ms", () => {
+    assert.equal(perfToEpochMs(1000, 1250, 5_000_250), 5_000_000);
   });
 
   it("does not end on a short pause between words", () => {

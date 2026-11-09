@@ -5,6 +5,7 @@ import { AudioScheduler } from "@/lib/audio/AudioScheduler";
 import { BargeInDetector } from "@/lib/audio/BargeInDetector";
 import { MicCapture } from "@/lib/audio/MicCapture";
 import { VoiceActivityDetector } from "@/lib/audio/VoiceActivityDetector";
+import { perfToEpochMs } from "@/lib/audio/vadCore";
 import { config } from "@/lib/config";
 import type { ServerEvent, ServerTurnMetrics, VoiceState } from "@/lib/realtime/protocol";
 import { CLOSE_PROTOCOL_MISMATCH, RealtimeClient } from "@/lib/realtime/RealtimeClient";
@@ -60,7 +61,7 @@ interface Rig {
   textGeneration: number | null;
   /** Turn id that owns the generation currently on the speaker (from `audio.started`). */
   audioTurnId: number | null;
-  /** `performance.now()` of the last VAD speech end that no audio has answered yet. */
+  /** `performance.now()` of the last voiced frame (true speech end) that no audio has answered yet. */
   speechEndAt: number | null;
   muted: boolean;
   speakerOn: boolean;
@@ -265,10 +266,12 @@ export function useVoiceSession({ language }: { language: string }) {
       client.speechStarted(Date.now());
       setUserSpeaking(true);
     });
-    vad.events.on("speechEnded", ({ at, misfire }) => {
-      client.speechEnded(Date.now());
+    vad.events.on("speechEnded", ({ lastVoicedAt, misfire }) => {
+      // The user stopped at lastVoicedAt, not when the 250 ms hangover elapsed: both the wire
+      // timestamp and the perceived-latency origin use the true end.
+      client.speechEnded(perfToEpochMs(lastVoicedAt, performance.now(), Date.now()));
       setUserSpeaking(false);
-      if (!misfire) rig.speechEndAt = at;
+      if (!misfire) rig.speechEndAt = lastVoicedAt;
     });
 
     client.connect();

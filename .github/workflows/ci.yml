@@ -61,6 +61,8 @@ jobs:
       - if: steps.present.outputs.yes == 'true'
         run: npx tsc --noEmit
       - if: steps.present.outputs.yes == 'true'
+        run: npm test
+      - if: steps.present.outputs.yes == 'true'
         run: npm run build
         env:
           # Dummy public values: the build only needs them to be defined, never to work.

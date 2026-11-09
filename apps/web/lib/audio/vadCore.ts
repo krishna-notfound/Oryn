@@ -57,7 +57,13 @@ export interface VadStarted {
 export interface VadEnded {
   type: "speechEnded";
   /** Time of the frame that confirmed the end (silence has lasted `endSilenceMs`). */
-  at: number;
+  endedAt: number;
+  /**
+   * Time of the last frame that still carried voice: when the user actually stopped talking.
+   * `endedAt - lastVoicedAt` is the end-silence hangover (>= `endSilenceMs`), which perceived
+   * latency must include.
+   */
+  lastVoicedAt: number;
   speechMs: number;
   /** Shorter than `minSpeechMs`: noise, cough, echo blip. */
   misfire: boolean;
@@ -153,7 +159,7 @@ export class VadCore {
   private finish(now: number): VadEnded {
     this.speaking = false;
     const speechMs = this.lastVoiceAt - this.onsetAt + this.config.frameMs;
-    return { type: "speechEnded", at: now, speechMs, misfire: speechMs < this.config.minSpeechMs };
+    return { type: "speechEnded", endedAt: now, lastVoicedAt: this.lastVoiceAt, speechMs, misfire: speechMs < this.config.minSpeechMs };
   }
 
   private learnFloor(level: number, active: boolean): void {
@@ -165,4 +171,9 @@ export class VadCore {
     }
     this.floor = Math.min(this.config.maxFloor, this.floor + (level - this.floor) * alpha);
   }
+}
+
+/** Converts a `performance.now()` timestamp to epoch ms, given a simultaneous reading of both clocks. */
+export function perfToEpochMs(perfMs: number, nowPerfMs: number, nowEpochMs: number): number {
+  return nowEpochMs - (nowPerfMs - perfMs);
 }

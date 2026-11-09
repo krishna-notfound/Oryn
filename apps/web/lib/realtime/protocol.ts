@@ -4,6 +4,11 @@
  *
  * Text frames: JSON `{"v":2,"type",...}` (client -> server) and
  *   `{"v":2,"type","session_id","turn_id"?,"generation_id"?,"seq","ts", ...payload}` (server -> client).
+ * `input.speech_started.ts` is epoch ms of the VAD event. `input.speech_ended.ts` is epoch ms of the
+ * LAST VOICED FRAME, i.e. when the user actually stopped talking, not of the emission that follows
+ * the 250 ms end-silence hangover. Server marks and the client's perceived_ms share that origin, so
+ * the hangover is part of the measured latency.
+ *
  * Binary frames:
  *   client -> server : PCM s16le mono at SessionReady.input_sample_rate, <= MAX_AUDIO_FRAME_BYTES
  *   server -> client : uint32 BE generation_id + uint32 BE seq (per-generation chunk index) + PCM s16le
