@@ -10,7 +10,15 @@ Phase 1 → 2: contracts are on `main`; parallel feature build in worktrees (dea
 
 | Worktree | Branch | Feature(s) | Owner |
 | -------- | ------ | ---------- | ----- |
-| see `git worktree list` | `feat/*` | see `docs/features/README.md` | Sonnet subagents, Opus reviews |
+| `.worktrees/F02-server` | `feat/F02-server` | F02 config/app, F03 auth+profile, F05 WS session, Supabase migration | Sonnet |
+| `.worktrees/F06-providers` | `feat/F06-providers` | F06 Prisma STT, F08 Timbre TTS, Sarvam LLM adapter, registry | Sonnet |
+| `.worktrees/F07-engine` | `feat/F07-engine` | F07 engine, F09 state machine + barge-in, F14 safety, F15 latency | Sonnet |
+| `.worktrees/F12-memory-tools` | `feat/F12-memory-tools` | F12 SQLite memory + extractor + REST, F13 tools | Sonnet |
+| `.worktrees/F01-web` | `feat/F01-web` | F01 web foundation, F04 onboarding, F10 chat, F08 playback (client) | Sonnet |
+| `.worktrees/F16-devops` | `feat/F16-devops` | F16 Docker, CI, deploy, README, testing/deployment docs | Sonnet |
+
+Merge order: F06 → F07 → F12 → F02 (then Opus wires `app/main.py` composition root) → F16 → F01.
+Supabase public schema is empty (checked 2026-11-09); migration applied by Opus after F02 merges.
 
 ## Completed
 
