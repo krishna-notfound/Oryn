@@ -1,0 +1,109 @@
+name: Deploy
+
+# Why workflow_run instead of `needs` in one workflow: CI already runs on every push to main, so
+# gating on its result avoids duplicating (or double-running) its jobs. The deploy only fires when
+# CI succeeded for a push to main, and always builds the exact commit CI validated (head_sha).
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+# Serialise deploys; never cancel one halfway through a rollout.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/krishna-notfound/oryn-backend
+
+jobs:
+  image:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      sha: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: backend
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.event.workflow_run.head_sha }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+
+  deploy:
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.image.outputs.sha }}
+
+      - name: Check deploy configuration
+        id: cfg
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          if [[ -n "$EC2_HOST" && -n "$EC2_USER" && -n "$EC2_SSH_KEY" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::EC2_HOST / EC2_USER / EC2_SSH_KEY not all set: image was pushed, deploy skipped."
+          fi
+
+      - name: Upload stack files and run deploy.sh
+        if: steps.cfg.outputs.enabled == 'true'
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+          TAG: ${{ needs.image.outputs.sha }}
+        run: |
+          install -m 700 -d ~/.ssh
+          install -m 600 /dev/null ~/.ssh/deploy_key
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/deploy_key
+          # Prefer a pinned host key (EC2_KNOWN_HOSTS); otherwise trust-on-first-use via keyscan.
+          if [[ -n "$EC2_KNOWN_HOSTS" ]]; then
+            printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -T 10 "$EC2_HOST" > ~/.ssh/known_hosts
+          fi
+          ssh_opts=(-i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes)
+          scp "${ssh_opts[@]}" \
+            infra/docker/docker-compose.prod.yml infra/docker/Caddyfile infra/scripts/deploy.sh \
+            "$EC2_USER@$EC2_HOST:/opt/oryn/"
+          ssh "${ssh_opts[@]}" "$EC2_USER@$EC2_HOST" "chmod +x /opt/oryn/deploy.sh && /opt/oryn/deploy.sh '$TAG'"
+
+      - name: Smoke test https://$ORYN_DOMAIN/health
+        if: steps.cfg.outputs.enabled == 'true'
+        env:
+          ORYN_DOMAIN: ${{ vars.ORYN_DOMAIN || secrets.ORYN_DOMAIN }}
+        run: |
+          if [[ -z "$ORYN_DOMAIN" ]]; then echo "::warning::ORYN_DOMAIN not set, smoke test skipped"; exit 0; fi
+          # Caddy may still be obtaining a certificate on the very first deploy: retry generously.
+          curl -fsS --retry 10 --retry-delay 6 --retry-all-errors --max-time 10 "https://${ORYN_DOMAIN}/health"

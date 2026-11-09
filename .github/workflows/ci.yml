@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy app
+      # `live` tests call real providers and run manually only.
+      - run: pytest -q -m "not live"
+      # Blocking on any known vulnerability; there is deliberately no --ignore-vuln list.
+      # Editable install of ourselves is not on PyPI, so skip it.
+      - run: pip install pip-audit && pip-audit --skip-editable
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      # hashFiles() is not available in job-level `if`, so detect once and gate each step.
+      - id: present
+        working-directory: .
+        run: echo "yes=$([ -f apps/web/package.json ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - if: steps.present.outputs.yes == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - if: steps.present.outputs.yes == 'true'
+        run: npm ci
+      - if: steps.present.outputs.yes == 'true'
+        run: npm run lint
+      - if: steps.present.outputs.yes == 'true'
+        run: npx tsc --noEmit
+      - if: steps.present.outputs.yes == 'true'
+        run: npm run build
+        env:
+          # Dummy public values: the build only needs them to be defined, never to work.
+          NEXT_PUBLIC_SUPABASE_URL: https://example.supabase.co
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: dummy-anon-key
+          NEXT_PUBLIC_BACKEND_WS_URL: wss://example.invalid/ws
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: backend
+          push: false
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # CLI instead of gitleaks-action: no license key needed, version and checksum pinned.
+      - name: Scan commits introduced by this change
+        env:
+          GITLEAKS_VERSION: 8.21.2
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          base_url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -O "${base_url}/${tarball}" -O "${base_url}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          sha256sum --ignore-missing -c "gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          tar -xzf "$tarball" gitleaks
+          # A new branch push has an all-zero "before"; scan everything in that case.
+          if [[ -n "$BASE_SHA" && ! "$BASE_SHA" =~ ^0+$ ]]; then range="${BASE_SHA}..${GITHUB_SHA}"; else range=""; fi
+          ./gitleaks git --redact --verbose ${range:+--log-opts="$range"} .
