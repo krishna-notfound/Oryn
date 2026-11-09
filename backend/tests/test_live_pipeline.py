@@ -140,9 +140,12 @@ def test_typed_message_gets_a_text_only_reply(
 
 
 def test_production_app_serves_health_metrics_and_guards_memories(tmp_path: Path) -> None:
-    with TestClient(build_app(fake_settings(tmp_path))) as client:
+    with TestClient(build_app(fake_settings(tmp_path, metrics_token="t"))) as client:
         assert client.get("/health").json()["status"] == "ok"
-        assert isinstance(client.get("/metrics").json(), dict)
+        assert client.get("/metrics").status_code == 401
+        assert isinstance(
+            client.get("/metrics", headers={"Authorization": "Bearer t"}).json(), dict
+        )
         assert client.get("/memories").status_code == 401
 
 

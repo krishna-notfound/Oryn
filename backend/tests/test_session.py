@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -214,6 +215,53 @@ def test_every_client_message_reaches_the_matching_method(harness: Harness) -> N
         ("playback_started", 3),
         ("playback_finished", 3),
     ]
+
+
+def test_max_sessions_rejects_with_4503() -> None:
+    harness = Harness(max_sessions=1)
+    with TestClient(harness.app) as client:
+        with ready_session(client, "token-a") as (first, _):
+            with client.websocket_connect("/ws") as second:
+                second.send_text(start_message("token-b"))
+                assert second.receive_json()["code"] == "at_capacity"
+                assert close_code(second) == 4503
+            sync(first)  # the session that has a seat is untouched
+            assert client.get("/health").json()["active_sessions"] == 1
+        assert [c.closed for c in harness.conversations] == [True]  # the rejected one never began
+
+
+def test_a_full_server_still_lets_a_user_reconnect_over_their_own_seat() -> None:
+    harness = Harness(max_sessions=1)
+    with (
+        TestClient(harness.app) as client,
+        ready_session(client, "token-a") as (first, _),
+        ready_session(client, "token-a") as (
+            second,
+            _,
+        ),
+    ):
+        assert close_code(first) == 4409
+        sync(second)
+
+
+def test_silent_client_is_closed_by_the_heartbeat_watchdog(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(session_module, "HEARTBEAT_TIMEOUT_S", 0.2)
+    with TestClient(harness.app) as client, ready_session(client) as (ws, _):
+        assert ws.receive_json()["code"] == "idle_timeout"
+        assert close_code(ws) == 4410
+        assert harness.conversations[0].closed
+
+
+def test_heartbeat_keeps_an_otherwise_quiet_session_alive(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(session_module, "HEARTBEAT_TIMEOUT_S", 0.3)
+    with TestClient(harness.app) as client, ready_session(client) as (ws, _):
+        for _ in range(4):
+            time.sleep(0.15)
+            sync(ws)
 
 
 def test_session_end_closes_cleanly_and_closes_conversation(harness: Harness) -> None:

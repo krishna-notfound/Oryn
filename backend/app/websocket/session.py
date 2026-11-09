@@ -56,6 +56,7 @@ log = logging.getLogger(__name__)
 
 INPUT_SAMPLE_RATE = 16_000
 MAX_STRIKES = 3
+HEARTBEAT_TIMEOUT_S = 45.0  # clients send a heartbeat every 15 s; mic frames count as traffic too
 MAX_TEXT_FRAME_BYTES = 65_536  # a JWT plus headroom; user.text is capped far lower
 # Nominal capture is ~50 frames/s; allow double that with a one-second burst.
 FRAME_BURST = 100
@@ -72,6 +73,8 @@ class CloseCode(IntEnum):
     HANDSHAKE_TIMEOUT = 4408
     SUPERSEDED = 4409
     RATE_LIMITED = 4429
+    IDLE_TIMEOUT = 4410
+    OVER_CAPACITY = 4503
 
 
 class WebSocketEventSink(EventSink):
@@ -149,19 +152,24 @@ class VoiceSession:
         started = time.monotonic()
         self._task = asyncio.current_task()
         code = CloseCode.NORMAL
+        limit = asyncio.timeout(self._services.settings.session_max_duration_s)
         try:
             await self._ws.accept()
             conversation = await self._handshake()
-            async with asyncio.timeout(self._services.settings.session_max_duration_s):
+            async with limit:
                 await self._route_frames(conversation)
         except _CloseSession as stop:
             code = stop.code
         except WebSocketDisconnect:
             pass
         except TimeoutError:
-            await self._sink.send_event(
-                PipelineError(code="session_limit", message="Session time limit reached.")
-            )
+            if limit.expired():
+                await self._sink.send_event(
+                    PipelineError(code="session_limit", message="Session time limit reached.")
+                )
+            else:  # a timeout from somewhere else is a bug, not the session limit
+                log.exception("session timed out", extra={"session_id": self.session_id})
+                code = await self._crashed()
         except asyncio.CancelledError:
             if self._evict_code is None:
                 raise
@@ -170,12 +178,15 @@ class VoiceSession:
                 self._task.uncancel()
         except Exception:
             log.exception("session crashed", extra={"session_id": self.session_id})
-            await self._sink.send_event(
-                PipelineError(code="internal", message="Something went wrong.", retryable=True)
-            )
-            code = CloseCode.INTERNAL_ERROR
+            code = await self._crashed()
         finally:
             await self._shutdown(code, started)
+
+    async def _crashed(self) -> CloseCode:
+        await self._sink.send_event(
+            PipelineError(code="internal", message="Something went wrong.", retryable=True)
+        )
+        return CloseCode.INTERNAL_ERROR
 
     def evict(self, code: CloseCode) -> None:
         """Called by the registry (from another session's task) to end this session."""
@@ -202,9 +213,13 @@ class VoiceSession:
         except AuthError:
             await self._fail(CloseCode.UNAUTHENTICATED, "unauthenticated", "Authentication failed.")
 
+        if svc.registry.is_full_for(user.user_id, svc.settings.max_sessions):
+            await self._reject_busy()  # before any slow work: profile, Prisma connect
         self._user_id = user.user_id
         context = await svc.profiles.load(user.user_id)
-        svc.registry.register(user.user_id, self)
+        if not svc.registry.register(user.user_id, self, svc.settings.max_sessions):
+            self._user_id = None  # never seated: shutdown must not release someone else's seat
+            await self._reject_busy()  # a burst took the last seat while the profile loaded
         conversation_id = await self._resolve_conversation(user.user_id, start)
         conversation = svc.conversation_factory(context, start, self._sink, conversation_id)
         self._conversation = conversation
@@ -228,6 +243,14 @@ class VoiceSession:
         )
         log.info("session started", extra={"session_id": self.session_id, "user_id": user.user_id})
         return conversation
+
+    async def _reject_busy(self) -> NoReturn:
+        await self._sink.send_event(
+            PipelineError(
+                code="at_capacity", message="Oryn is busy, please try again.", retryable=True
+            )
+        )
+        raise _CloseSession(CloseCode.OVER_CAPACITY)
 
     async def _fail(self, code: CloseCode, error_code: str, message: str) -> NoReturn:
         await self._sink.send_event(PipelineError(code=error_code, message=message))
@@ -266,7 +289,11 @@ class VoiceSession:
 
     async def _route_frames(self, conversation: Conversation) -> None:
         while True:
-            frame = await self._receive()
+            try:
+                async with asyncio.timeout(HEARTBEAT_TIMEOUT_S):
+                    frame = await self._receive()
+            except TimeoutError:
+                await self._fail(CloseCode.IDLE_TIMEOUT, "idle_timeout", "No heartbeat received.")
             if not self._bucket.allow():
                 await self._fail(CloseCode.RATE_LIMITED, "rate_limited", "Too many frames.")
             if (audio := frame.get("bytes")) is not None:
@@ -359,11 +386,19 @@ class SessionRegistry:
     def __init__(self) -> None:
         self._by_user: dict[str, VoiceSession] = {}
 
-    def register(self, user_id: str, session: VoiceSession) -> None:
+    def is_full_for(self, user_id: str, limit: int) -> bool:
+        """Would `user_id` be turned away? A reconnect replaces its own seat, so never."""
+        return user_id not in self._by_user and len(self._by_user) >= limit
+
+    def register(self, user_id: str, session: VoiceSession, limit: int) -> bool:
+        """Take a seat, superseding the user's older session. False if the server is full."""
+        if self.is_full_for(user_id, limit):
+            return False
         previous = self._by_user.get(user_id)
         self._by_user[user_id] = session
         if previous is not None:
             previous.evict(CloseCode.SUPERSEDED)
+        return True
 
     def release(self, user_id: str, session: VoiceSession) -> None:
         if self._by_user.get(user_id) is session:

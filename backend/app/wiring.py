@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Sequence
 
 import httpx
 
 from app.config import Settings
-from app.conversation.engine import MessageHook, VoiceConversation
+from app.conversation.engine import HistoryLoader, MessageHook, VoiceConversation
 from app.conversation.ports import Conversation, EventSink, UserContext
 from app.memory.extractor import MemoryExtractor
 from app.memory.store import SQLiteMemoryStore
-from app.persistence.conversations import ConversationRepository, Role
+from app.persistence.conversations import ConversationRepository, Role, StoredMessage
 from app.providers.registry import build_providers
 from app.tools.builtin import build_default_tools
 from app.tools.registry import ToolRegistry
@@ -60,7 +61,18 @@ class OrynRuntime:
             tools=self.tools,
             after_turn=self._extract_memories,
             on_message=self._history_writer(user, conversation_id),
+            load_history=self._history_reader(user, conversation_id),
         )
+
+    def _history_reader(self, user: UserContext, conversation_id: str) -> HistoryLoader:
+        """What an earlier connection of this conversation said (empty for a new one), so a
+        reconnect does not reset Oryn's short-term memory."""
+        limit = 2 * self._settings.context_max_turns
+
+        async def load() -> Sequence[StoredMessage]:
+            return await self._conversations.recent(conversation_id, user.user_id, limit)
+
+        return load
 
     def _history_writer(self, user: UserContext, conversation_id: str) -> MessageHook | None:
         """Persist the transcript only for users who keep history on."""
