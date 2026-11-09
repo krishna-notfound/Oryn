@@ -6,7 +6,9 @@ export default async function Page() {
   const { user, profile } = await getUserAndProfile();
   if (profile?.onboarded_at) redirect("/talk");
 
-  // Google sign-in provides a full name; use its first word as a starting suggestion.
+  // Guests start from their username (getUserAndProfile guarantees they have one); Google
+  // sign-in provides a full name whose first word is a good starting suggestion.
   const metaName = typeof user.user_metadata?.full_name === "string" ? user.user_metadata.full_name : "";
-  return <OnboardingFlow userId={user.id} initialName={profile?.preferred_name ?? metaName.split(" ")[0] ?? ""} />;
+  const suggestion = user.is_anonymous ? (profile?.username ?? "") : (metaName.split(" ")[0] ?? "");
+  return <OnboardingFlow userId={user.id} initialName={profile?.preferred_name ?? suggestion} />;
 }

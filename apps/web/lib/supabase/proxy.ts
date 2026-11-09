@@ -26,7 +26,8 @@ export async function updateSession(request: NextRequest): Promise<NextResponse>
   // Validates the JWT (and refreshes it when expired); do not put logic between client creation and this call.
   const { data } = await supabase.auth.getClaims();
   const signedIn = Boolean(data?.claims);
-  const { pathname } = request.nextUrl;
+  const isGuest = data?.claims?.is_anonymous === true;
+  const { pathname, searchParams } = request.nextUrl;
 
   const redirectTo = (path: string) => {
     const redirect = NextResponse.redirect(new URL(path, request.url));
@@ -36,6 +37,7 @@ export async function updateSession(request: NextRequest): Promise<NextResponse>
   };
 
   if (!signedIn && PROTECTED_PREFIXES.some((prefix) => pathname.startsWith(prefix))) return redirectTo("/");
-  if (signedIn && pathname === "/") return redirectTo("/talk");
+  // Guests (anonymous users) count as signed in; they only see the welcome screen to pick a username.
+  if (signedIn && pathname === "/" && !(isGuest && searchParams.has("pick"))) return redirectTo("/talk");
   return response;
 }

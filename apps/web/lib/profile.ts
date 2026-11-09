@@ -51,6 +51,8 @@ export const INTERESTS = [
 export interface Profile {
   id: string;
   preferred_name: string | null;
+  /** Guest handle (null for Google accounts); set at guest sign-in, not by onboarding. */
+  username: string | null;
   timezone: string;
   primary_language: string;
   extra_languages: string[];
@@ -68,7 +70,7 @@ export interface Profile {
 }
 
 /** What the browser may write; `id` is always the signed-in user. */
-export type ProfileInput = Omit<Profile, "id" | "onboarded_at">;
+export type ProfileInput = Omit<Profile, "id" | "username" | "onboarded_at">;
 
 export const DEFAULT_PROFILE: ProfileInput = {
   preferred_name: null,
