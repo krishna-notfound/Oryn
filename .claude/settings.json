@@ -1,7 +1,0 @@
-{
-  "enabledPlugins": {
-    "superpowers@anthropic-plugin-directory": true,
-    "playwright@anthropic-plugin-directory": true,
-    "ponytail@ponytail": true
-  }
-}

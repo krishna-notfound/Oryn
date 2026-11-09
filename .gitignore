@@ -26,3 +26,10 @@ data/
 *.zip
 coverage/
 .DS_Store
+
+# local-only project knowledge (never pushed): docs, design exports, agent config
+docs/
+design/
+CLAUDE.md
+.claude/
+.mcp.json
