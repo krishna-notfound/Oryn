@@ -29,20 +29,24 @@ from app.conversation.ports import Conversation, EventSink, UserContext
 from app.persistence.conversations import ConversationRepository
 from app.persistence.postgrest import PersistenceError
 from app.providers.base import ProviderError
+from app.voice.latency import latency_stats
 from app.websocket.protocol import (
     MAX_AUDIO_FRAME_BYTES,
-    AudioEnd,
-    ErrorEvent,
-    Ping,
+    ClientTurnMetrics,
+    Heartbeat,
+    InputSpeechEnded,
+    InputSpeechStarted,
+    PipelineError,
     PlaybackFinished,
     PlaybackStarted,
-    Pong,
     ServerEvent,
+    ServerHeartbeat,
     SessionEnd,
     SessionReady,
     SessionStart,
-    UserInterrupt,
+    TurnCancel,
     UserText,
+    encode_event,
     pack_audio_frame,
     parse_client_message,
 )
@@ -52,6 +56,7 @@ log = logging.getLogger(__name__)
 
 INPUT_SAMPLE_RATE = 16_000
 MAX_STRIKES = 3
+HEARTBEAT_TIMEOUT_S = 45.0  # clients send a heartbeat every 15 s; mic frames count as traffic too
 MAX_TEXT_FRAME_BYTES = 65_536  # a JWT plus headroom; user.text is capped far lower
 # Nominal capture is ~50 frames/s; allow double that with a one-second burst.
 FRAME_BURST = 100
@@ -68,36 +73,47 @@ class CloseCode(IntEnum):
     HANDSHAKE_TIMEOUT = 4408
     SUPERSEDED = 4409
     RATE_LIMITED = 4429
+    IDLE_TIMEOUT = 4410
+    OVER_CAPACITY = 4503
 
 
 class WebSocketEventSink(EventSink):
     """Serialises writes to the socket and silently drops them once it is gone."""
 
-    def __init__(self, websocket: WebSocket) -> None:
+    def __init__(self, websocket: WebSocket, session_id: str) -> None:
         self._websocket = websocket
+        self._session_id = session_id
         self._lock = asyncio.Lock()
+        self._seq = 0
         self._closed = False
 
     async def send_event(self, event: ServerEvent) -> None:
-        await self._send(event.model_dump_json())
+        await self._send(event)
 
-    async def send_audio(self, generation_id: int, pcm: bytes) -> None:
-        await self._send(pack_audio_frame(generation_id, pcm))
+    async def send_audio(self, generation_id: int, seq: int, pcm: bytes) -> None:
+        await self._send(pack_audio_frame(generation_id, seq, pcm))
 
     def close(self) -> None:
         self._closed = True
 
-    async def _send(self, payload: str | bytes) -> None:
+    async def _send(self, payload: ServerEvent | bytes) -> None:
         if self._closed:
             return
         async with self._lock:
             if self._closed:
                 return
             try:
-                if isinstance(payload, str):
-                    await self._websocket.send_text(payload)
-                else:
+                if isinstance(payload, bytes):
                     await self._websocket.send_bytes(payload)
+                else:
+                    self._seq += 1  # taken under the lock, so numbers follow wire order
+                    text = encode_event(
+                        payload,
+                        session_id=self._session_id,
+                        seq=self._seq,
+                        ts=int(time.time() * 1000),
+                    )
+                    await self._websocket.send_text(text)
             except (RuntimeError, WebSocketDisconnect):
                 self._closed = True
 
@@ -123,7 +139,7 @@ class VoiceSession:
         self.session_id = uuid.uuid4().hex
         self._ws = websocket
         self._services = services
-        self._sink = WebSocketEventSink(websocket)
+        self._sink = WebSocketEventSink(websocket, self.session_id)
         self._bucket = TokenBucket(FRAME_BURST, FRAMES_PER_SECOND)
         self._conversation: Conversation | None = None
         self._user_id: str | None = None
@@ -136,19 +152,24 @@ class VoiceSession:
         started = time.monotonic()
         self._task = asyncio.current_task()
         code = CloseCode.NORMAL
+        limit = asyncio.timeout(self._services.settings.session_max_duration_s)
         try:
             await self._ws.accept()
             conversation = await self._handshake()
-            async with asyncio.timeout(self._services.settings.session_max_duration_s):
+            async with limit:
                 await self._route_frames(conversation)
         except _CloseSession as stop:
             code = stop.code
         except WebSocketDisconnect:
             pass
         except TimeoutError:
-            await self._sink.send_event(
-                ErrorEvent(code="session_limit", message="Session time limit reached.")
-            )
+            if limit.expired():
+                await self._sink.send_event(
+                    PipelineError(code="session_limit", message="Session time limit reached.")
+                )
+            else:  # a timeout from somewhere else is a bug, not the session limit
+                log.exception("session timed out", extra={"session_id": self.session_id})
+                code = await self._crashed()
         except asyncio.CancelledError:
             if self._evict_code is None:
                 raise
@@ -157,12 +178,15 @@ class VoiceSession:
                 self._task.uncancel()
         except Exception:
             log.exception("session crashed", extra={"session_id": self.session_id})
-            await self._sink.send_event(
-                ErrorEvent(code="internal", message="Something went wrong.", retryable=True)
-            )
-            code = CloseCode.INTERNAL_ERROR
+            code = await self._crashed()
         finally:
             await self._shutdown(code, started)
+
+    async def _crashed(self) -> CloseCode:
+        await self._sink.send_event(
+            PipelineError(code="internal", message="Something went wrong.", retryable=True)
+        )
+        return CloseCode.INTERNAL_ERROR
 
     def evict(self, code: CloseCode) -> None:
         """Called by the registry (from another session's task) to end this session."""
@@ -189,9 +213,13 @@ class VoiceSession:
         except AuthError:
             await self._fail(CloseCode.UNAUTHENTICATED, "unauthenticated", "Authentication failed.")
 
+        if svc.registry.is_full_for(user.user_id, svc.settings.max_sessions):
+            await self._reject_busy()  # before any slow work: profile, Prisma connect
         self._user_id = user.user_id
         context = await svc.profiles.load(user.user_id)
-        svc.registry.register(user.user_id, self)
+        if not svc.registry.register(user.user_id, self, svc.settings.max_sessions):
+            self._user_id = None  # never seated: shutdown must not release someone else's seat
+            await self._reject_busy()  # a burst took the last seat while the profile loaded
         conversation_id = await self._resolve_conversation(user.user_id, start)
         conversation = svc.conversation_factory(context, start, self._sink, conversation_id)
         self._conversation = conversation
@@ -208,7 +236,6 @@ class VoiceSession:
         # on `session.ready` would otherwise queue a burst that trips the frame rate limit.
         await self._sink.send_event(
             SessionReady(
-                session_id=self.session_id,
                 conversation_id=conversation_id,
                 input_sample_rate=INPUT_SAMPLE_RATE,
                 output_sample_rate=svc.settings.gnani_tts_sample_rate,
@@ -217,8 +244,16 @@ class VoiceSession:
         log.info("session started", extra={"session_id": self.session_id, "user_id": user.user_id})
         return conversation
 
+    async def _reject_busy(self) -> NoReturn:
+        await self._sink.send_event(
+            PipelineError(
+                code="at_capacity", message="Oryn is busy, please try again.", retryable=True
+            )
+        )
+        raise _CloseSession(CloseCode.OVER_CAPACITY)
+
     async def _fail(self, code: CloseCode, error_code: str, message: str) -> NoReturn:
-        await self._sink.send_event(ErrorEvent(code=error_code, message=message))
+        await self._sink.send_event(PipelineError(code=error_code, message=message))
         raise _CloseSession(code)
 
     def _parse_start(self, text: str | None) -> SessionStart:
@@ -254,7 +289,11 @@ class VoiceSession:
 
     async def _route_frames(self, conversation: Conversation) -> None:
         while True:
-            frame = await self._receive()
+            try:
+                async with asyncio.timeout(HEARTBEAT_TIMEOUT_S):
+                    frame = await self._receive()
+            except TimeoutError:
+                await self._fail(CloseCode.IDLE_TIMEOUT, "idle_timeout", "No heartbeat received.")
             if not self._bucket.allow():
                 await self._fail(CloseCode.RATE_LIMITED, "rate_limited", "Too many frames.")
             if (audio := frame.get("bytes")) is not None:
@@ -279,24 +318,40 @@ class VoiceSession:
         match message:
             case UserText(text=text):
                 await conversation.on_text(text)
-            case UserInterrupt():
-                await conversation.on_interrupt()
-            case AudioEnd():
-                await conversation.on_audio_end()
+            case InputSpeechStarted():
+                await conversation.on_speech_started()
+            case InputSpeechEnded():
+                await conversation.on_speech_ended()
+            case TurnCancel(generation_id=generation_id):
+                await conversation.on_cancel(generation_id)
             case PlaybackStarted(generation_id=generation_id):
                 await conversation.on_playback_started(generation_id)
             case PlaybackFinished(generation_id=generation_id):
                 await conversation.on_playback_finished(generation_id)
-            case Ping():
-                await self._sink.send_event(Pong())
+            case ClientTurnMetrics():
+                self._record_client_metrics(message)
+            case Heartbeat():
+                await self._sink.send_event(ServerHeartbeat())
             case SessionEnd():
                 raise _CloseSession(CloseCode.NORMAL)
             case SessionStart():
                 await self._strike("Session already started.")
 
+    def _record_client_metrics(self, message: ClientTurnMetrics) -> None:
+        latency_stats.record_perceived(message.perceived_ms)
+        log.info(
+            "client turn metrics",
+            extra={
+                "session_id": self.session_id,
+                "turn_id": message.turn_id,
+                "perceived_ms": message.perceived_ms,
+                "playback_lead_ms": message.playback_lead_ms,
+            },
+        )
+
     async def _strike(self, message: str) -> None:
         self._strikes += 1
-        await self._sink.send_event(ErrorEvent(code="bad_message", message=message))
+        await self._sink.send_event(PipelineError(code="bad_message", message=message))
         if self._strikes >= MAX_STRIKES:
             raise _CloseSession(CloseCode.BAD_MESSAGE)
 
@@ -331,11 +386,19 @@ class SessionRegistry:
     def __init__(self) -> None:
         self._by_user: dict[str, VoiceSession] = {}
 
-    def register(self, user_id: str, session: VoiceSession) -> None:
+    def is_full_for(self, user_id: str, limit: int) -> bool:
+        """Would `user_id` be turned away? A reconnect replaces its own seat, so never."""
+        return user_id not in self._by_user and len(self._by_user) >= limit
+
+    def register(self, user_id: str, session: VoiceSession, limit: int) -> bool:
+        """Take a seat, superseding the user's older session. False if the server is full."""
+        if self.is_full_for(user_id, limit):
+            return False
         previous = self._by_user.get(user_id)
         self._by_user[user_id] = session
         if previous is not None:
             previous.evict(CloseCode.SUPERSEDED)
+        return True
 
     def release(self, user_id: str, session: VoiceSession) -> None:
         if self._by_user.get(user_id) is session:

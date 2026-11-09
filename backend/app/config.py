@@ -61,6 +61,11 @@ class Settings(BaseSettings):
     session_handshake_timeout_s: float = 5.0
     session_max_duration_s: float = 15 * 60
 
+    # Realtime pipeline v2
+    max_sessions: int = Field(default=20, ge=1)  # concurrent sessions; beyond it close 4503
+    metrics_token: SecretStr | None = None  # bearer token for /metrics; unset = endpoint closed
+    endpoint_grace_ms: int = Field(default=180, ge=0)  # speculative turn audio gate
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def _split_origins(cls, value: object) -> object:

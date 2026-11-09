@@ -10,7 +10,12 @@ from websockets.asyncio.server import ServerConnection, serve
 
 from app.config import Settings
 from app.providers.base import ProviderError, SpeechStarted, STTEvent, TranscriptEvent
-from app.providers.gnani_prisma import FrameChunker, GnaniPrismaSTT
+from app.providers.gnani_prisma import (
+    EVENT_QUEUE_SIZE,
+    FrameChunker,
+    GnaniPrismaSTT,
+    GnaniPrismaSTTStream,
+)
 
 Handler = Callable[[ServerConnection], Awaitable[None]]
 
@@ -235,3 +240,87 @@ async def test_close_is_idempotent_and_terminates_events() -> None:
         await stream.close()
         async with asyncio.timeout(3):
             assert [e async for e in stream.events()] == []
+
+
+# ---------------------------------------------------------------- robustness
+
+
+async def test_payloads_that_are_not_json_objects_are_ignored() -> None:
+    async def handler(ws: ServerConnection) -> None:
+        await ws.send("[1, 2, 3]")
+        await ws.send('"just a string"')
+        await ws.send(json.dumps({"type": "transcript", "text": "still works"}))
+        await ws.wait_closed()
+
+    async with prisma(handler) as settings:
+        stream = await GnaniPrismaSTT(settings).open_stream("en-IN")
+        try:
+            (event,) = await take(stream.events(), 1)
+            assert isinstance(event, TranscriptEvent) and event.text == "still works"
+        finally:
+            await stream.close()
+
+
+class _FloodSocket:
+    """A websocket that delivers far more transcripts than the consumer will read."""
+
+    close_code = None
+    close_reason = None
+
+    def __init__(self, count: int) -> None:
+        self._count = count
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[str]:
+        for i in range(self._count):
+            yield json.dumps({"type": "transcript", "text": f"t{i}"})
+        await asyncio.sleep(60)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def test_event_queue_is_bounded_when_nobody_reads() -> None:
+    socket = _FloodSocket(EVENT_QUEUE_SIZE * 3)
+    stream = GnaniPrismaSTTStream(socket)  # type: ignore[arg-type]
+    await asyncio.sleep(0.1)
+    assert stream._events.qsize() == EVENT_QUEUE_SIZE  # noqa: SLF001 - full, and no fuller
+
+    await stream.close()  # even with a full queue, close terminates events()
+    async with asyncio.timeout(3):
+        assert len([e async for e in stream.events()]) <= EVENT_QUEUE_SIZE
+
+
+class _SlowToStopSocket:
+    """A websocket whose reader needs a moment to wind down after being cancelled."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.close_code = None
+        self.close_reason = None
+
+    def __aiter__(self) -> "_SlowToStopSocket":
+        return self
+
+    async def __anext__(self) -> str:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.2)
+            raise
+        return ""
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def test_close_does_not_swallow_the_cancellation_of_its_caller() -> None:
+    socket = _SlowToStopSocket()
+    stream = GnaniPrismaSTTStream(socket)  # type: ignore[arg-type]
+    closing = asyncio.create_task(stream.close())
+    await asyncio.sleep(0.05)  # close() is now waiting for the reader to stop
+
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert socket.closed  # and the socket was still released

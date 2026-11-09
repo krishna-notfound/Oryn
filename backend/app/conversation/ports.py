@@ -39,7 +39,7 @@ class EventSink(ABC):
     async def send_event(self, event: ServerEvent) -> None: ...
 
     @abstractmethod
-    async def send_audio(self, generation_id: int, pcm: bytes) -> None: ...
+    async def send_audio(self, generation_id: int, seq: int, pcm: bytes) -> None: ...
 
 
 class Conversation(ABC):
@@ -53,13 +53,19 @@ class Conversation(ABC):
     async def on_audio(self, chunk: bytes) -> None: ...
 
     @abstractmethod
-    async def on_audio_end(self) -> None: ...
+    async def on_speech_started(self) -> None:
+        """The browser's VAD heard the user start speaking."""
+
+    @abstractmethod
+    async def on_speech_ended(self) -> None:
+        """The browser's VAD heard the user stop: finish the utterance now."""
 
     @abstractmethod
     async def on_text(self, text: str) -> None: ...
 
     @abstractmethod
-    async def on_interrupt(self) -> None: ...
+    async def on_cancel(self, generation_id: int) -> None:
+        """The browser stopped playing `generation_id`. Ignored if that is no longer live."""
 
     @abstractmethod
     async def on_playback_started(self, generation_id: int) -> None: ...

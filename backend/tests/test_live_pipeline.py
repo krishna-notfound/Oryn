@@ -68,26 +68,34 @@ def test_spoken_turn_flows_from_microphone_to_speaker(
 ) -> None:
     client, history = stack
     with client, client.websocket_connect("/ws") as ws:
-        ws.send_text(json.dumps({"type": "session.start", "token": "valid", "language": "hi-IN"}))
+        ws.send_text(
+            json.dumps({"v": 2, "type": "session.start", "token": "valid", "language": "hi-IN"})
+        )
         ready, _ = receive_until(ws, "session.ready")
 
+        ws.send_text(json.dumps({"v": 2, "type": "input.speech_started"}))
         ws.send_bytes(bytes(640))  # 20 ms of 16 kHz PCM
-        ws.send_text(json.dumps({"type": "audio.end"}))
-        events, audio_frames = receive_until(ws, "assistant.done")
+        ws.send_text(json.dumps({"v": 2, "type": "input.speech_ended"}))
+        events, audio_frames = receive_until(ws, "turn.completed")
 
         types = [e["type"] for e in events]
-        assert types.index("transcript.final") < types.index("assistant.audio.start")
+        assert types.index("transcript.final") < types.index("audio.started")
+        assert types.index("audio.completed") < types.index("turn.completed")
         assert audio_frames > 0
         done = events[-1]
         states = [e["state"] for e in ready + events if e["type"] == "state"]
         assert states == ["LISTENING", "PROCESSING", "GENERATING", "SPEAKING"]
+        seqs = [e["seq"] for e in ready + events]
+        assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)  # strictly increasing
 
         ws.send_text(
-            json.dumps({"type": "playback.finished", "generation_id": done["generation_id"]})
+            json.dumps(
+                {"v": 2, "type": "playback.finished", "generation_id": done["generation_id"]}
+            )
         )
         after, _ = receive_until(ws, "state")
-        assert after[-1] == {"type": "state", "state": "LISTENING"}
-        assert [e["type"] for e in after] == ["metrics", "state"]
+        assert after[-1]["state"] == "LISTENING"
+        assert [e["type"] for e in after] == ["turn.metrics", "state"]
 
     conversation_id = ready[-1]["conversation_id"]
     stored = history._messages[conversation_id]  # noqa: SLF001 - test-only peek
@@ -99,19 +107,19 @@ def test_audio_frames_carry_the_generation_of_the_reply(
 ) -> None:
     client, _ = stack
     with client, client.websocket_connect("/ws") as ws:
-        ws.send_text(json.dumps({"type": "session.start", "token": "valid"}))
+        ws.send_text(json.dumps({"v": 2, "type": "session.start", "token": "valid"}))
         receive_until(ws, "session.ready")
         ws.send_bytes(bytes(640))
-        ws.send_text(json.dumps({"type": "audio.end"}))
+        ws.send_text(json.dumps({"v": 2, "type": "input.speech_ended"}))
 
         generation: int | None = None
         while True:
             message = ws.receive()
             if (frame := message.get("bytes")) is not None:
-                assert AUDIO_HEADER.unpack(frame[:4]) == (generation,)
+                assert AUDIO_HEADER.unpack(frame[:8]) == (generation, 0)  # first chunk of the reply
                 break
             event = json.loads(message["text"])
-            if event["type"] == "assistant.audio.start":
+            if event["type"] == "audio.started":
                 generation = event["generation_id"]
 
 
@@ -120,19 +128,24 @@ def test_typed_message_gets_a_text_only_reply(
 ) -> None:
     client, _ = stack
     with client, client.websocket_connect("/ws") as ws:
-        ws.send_text(json.dumps({"type": "session.start", "token": "valid", "mode": "text"}))
+        ws.send_text(
+            json.dumps({"v": 2, "type": "session.start", "token": "valid", "mode": "text"})
+        )
         receive_until(ws, "session.ready")
-        ws.send_text(json.dumps({"type": "user.text", "text": "hello"}))
-        events, audio_frames = receive_until(ws, "assistant.done")
+        ws.send_text(json.dumps({"v": 2, "type": "user.text", "text": "hello"}))
+        events, audio_frames = receive_until(ws, "turn.completed")
 
     assert audio_frames == 0
-    assert any(e["type"] == "assistant.text" for e in events)
+    assert any(e["type"] == "text.delta" for e in events)
 
 
 def test_production_app_serves_health_metrics_and_guards_memories(tmp_path: Path) -> None:
-    with TestClient(build_app(fake_settings(tmp_path))) as client:
+    with TestClient(build_app(fake_settings(tmp_path, metrics_token="t"))) as client:
         assert client.get("/health").json()["status"] == "ok"
-        assert isinstance(client.get("/metrics").json(), dict)
+        assert client.get("/metrics").status_code == 401
+        assert isinstance(
+            client.get("/metrics", headers={"Authorization": "Bearer t"}).json(), dict
+        )
         assert client.get("/memories").status_code == 401
 
 

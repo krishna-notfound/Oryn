@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
+from typing import Annotated, Any
 
-from fastapi import APIRouter, FastAPI, WebSocket
+from fastapi import APIRouter, FastAPI, Header, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import SecretStr
 
 from app.auth.profiles import ProfileRepository
 from app.auth.supabase import Authenticator, SupabaseAuthenticator
 from app.config import Settings, get_settings
 from app.memory.api import build_memory_router
+from app.observability import LoopLagMonitor, rss_bytes
 from app.persistence.conversations import (
     ConversationRepository,
     InMemoryConversationRepository,
@@ -57,9 +61,13 @@ def create_app(
         registry=registry,
     )
 
+    loop_lag = LoopLagMonitor()
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        loop_lag.start()
         yield
+        await loop_lag.stop()
         for shutdown in on_shutdown:
             await shutdown()
         await postgrest.aclose()
@@ -80,15 +88,33 @@ def create_app(
         return {"status": "ok", "active_sessions": len(registry)}
 
     @app.get("/metrics")
-    async def metrics() -> dict[str, dict[str, float]]:
-        """Rolling p50/p95 per pipeline stage, in milliseconds."""
-        return latency_stats.summary()
+    async def metrics(authorization: Annotated[str | None, Header()] = None) -> dict[str, Any]:
+        """Per-stage p50/p95/p99 (ms), event-loop lag, memory and session count. Bearer
+        `METRICS_TOKEN`; with no token configured the endpoint does not exist."""
+        _require_bearer(settings.metrics_token, authorization)
+        return {
+            "latency_ms": latency_stats.summary(),
+            "event_loop_lag_ms": loop_lag.summary(),
+            "rss_bytes": rss_bytes(),
+            "active_sessions": len(registry),
+            "max_sessions": settings.max_sessions,
+        }
 
     @app.websocket("/ws")
     async def voice_socket(websocket: WebSocket) -> None:
         await VoiceSession(websocket, services).run()
 
     return app
+
+
+def _require_bearer(expected: SecretStr | None, authorization: str | None) -> None:
+    if expected is None:
+        raise HTTPException(status_code=404)
+    scheme, _, presented = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not hmac.compare_digest(
+        presented.encode(), expected.get_secret_value().encode()
+    ):
+        raise HTTPException(status_code=401, headers={"WWW-Authenticate": "Bearer"})
 
 
 def _conversation_repository(postgrest: PostgrestClient) -> ConversationRepository:
