@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -136,6 +137,21 @@ def test_first_frame_must_be_session_start(harness: Harness, first: str) -> None
     with TestClient(harness.app) as client, client.websocket_connect("/ws") as ws:
         ws.send_text(first)
         assert close_code(ws) == 4400
+
+
+def test_ready_is_sent_only_after_the_conversation_has_started(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opening the STT stream is slow; a client streaming on `ready` would trip the rate limit."""
+
+    async def slow_start(self: RecordingConversation) -> None:
+        await asyncio.sleep(0.1)
+        self.calls.append(("start",))
+
+    monkeypatch.setattr(RecordingConversation, "start", slow_start)
+    with ready_session(TestClient(harness.app)) as (_, ready):
+        assert ready["type"] == "session.ready"
+        assert ("start",) in harness.conversations[0].calls
 
 
 def test_ready_uses_verified_identity_never_browser_ids(harness: Harness) -> None:

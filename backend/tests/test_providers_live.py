@@ -10,6 +10,7 @@ from app.config import Settings
 from app.providers.base import ChatMessage
 from app.providers.gnani_prisma import GnaniPrismaSTT
 from app.providers.gnani_timbre import GnaniTimbreTTS
+from app.providers.openai_embeddings import OpenAICompatibleEmbedder
 from app.providers.sarvam_llm import SarvamLanguageModel
 
 pytestmark = pytest.mark.live
@@ -41,3 +42,13 @@ async def test_timbre_returns_pcm_and_prisma_accepts_it(live_settings: Settings)
         await asyncio.sleep(0.5)
     finally:
         await stream.close()
+
+
+async def test_embeddings_match_the_configured_dimensions(live_settings: Settings) -> None:
+    if not (live_settings.embeddings_base_url and live_settings.embeddings_model):
+        pytest.skip("embeddings are not configured")
+    async with httpx.AsyncClient(timeout=15) as client:
+        vectors = await OpenAICompatibleEmbedder(live_settings, client).embed(
+            ["I like chai", "mujhe chai pasand hai"]
+        )
+    assert [len(v) for v in vectors] == [live_settings.embeddings_dimensions] * 2

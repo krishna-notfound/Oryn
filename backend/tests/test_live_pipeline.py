@@ -79,7 +79,7 @@ def test_spoken_turn_flows_from_microphone_to_speaker(
         assert types.index("transcript.final") < types.index("assistant.audio.start")
         assert audio_frames > 0
         done = events[-1]
-        states = [e["state"] for e in events if e["type"] == "state"]
+        states = [e["state"] for e in ready + events if e["type"] == "state"]
         assert states == ["LISTENING", "PROCESSING", "GENERATING", "SPEAKING"]
 
         ws.send_text(

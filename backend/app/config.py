@@ -7,7 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     gnani_tts_model: str = "timbre-v2.5"
     gnani_tts_voice: str = ""
     gnani_tts_sample_rate: int = 24_000
+    gnani_tts_max_concurrent: int = Field(default=1, ge=1)  # simultaneous synth requests
 
     # Sarvam conversational LLM
     sarvam_api_key: SecretStr | None = None

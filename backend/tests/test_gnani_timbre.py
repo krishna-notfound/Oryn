@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 
@@ -189,3 +190,24 @@ async def test_closing_the_consumer_closes_the_response() -> None:
     assert await anext(stream) == b"ab"
     await stream.aclose()  # what cancelling the consumer triggers
     assert closed
+
+
+async def test_second_synthesis_waits_for_the_first_to_finish() -> None:
+    """The account 429s simultaneous requests, so they queue behind one another."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return sse(START, chunk(0, b"\x01\x02"), chunk(1, b"\x03\x04"), COMPLETE)
+
+    tts = make_tts(httpx.MockTransport(handler))
+    first = tts.synthesize("one", language="en-IN")
+    assert await anext(first) == b"\x01\x02"  # the first request now holds the slot
+
+    second = asyncio.create_task(pcm_of(tts, "two"))
+    await asyncio.sleep(0.05)
+    assert len(requests) == 1 and not second.done()
+
+    assert [c async for c in first] == [b"\x03\x04"]
+    assert await second == [b"\x01\x02", b"\x03\x04"]
+    assert len(requests) == 2
