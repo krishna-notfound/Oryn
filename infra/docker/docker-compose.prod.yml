@@ -4,6 +4,8 @@
 #   Caddyfile
 # Only Caddy publishes ports; the backend is reachable on the internal network only.
 
+name: oryn
+
 services:
   backend:
     image: ghcr.io/krishna-notfound/oryn-backend:${IMAGE_TAG:?IMAGE_TAG is not set (deploy.sh writes it to .env)}
