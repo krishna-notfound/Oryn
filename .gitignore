@@ -33,3 +33,7 @@ design/
 CLAUDE.md
 .claude/
 .mcp.json
+
+# private keys — never commit
+*.pem
+*.key
