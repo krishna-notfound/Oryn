@@ -47,11 +47,15 @@ verified user id. The browser uses the anon key + RLS.
 ## SQLite memory (`MEMORY_DB_PATH`, persistent volume)
 
 ```sql
-memories(id TEXT PK, user_id TEXT, content TEXT, category TEXT, confidence REAL,
-         source_conversation_id TEXT, created_at TEXT, updated_at TEXT)
-memories_fts  -- FTS5 over content, external content = memories
-memories_vec  -- sqlite-vec vec0(embedding float[N]), rowid ↔ memories
+memories(seq INTEGER PK AUTOINCREMENT, id TEXT UNIQUE, user_id TEXT, content TEXT, category TEXT,
+         confidence REAL, source_conversation_id TEXT, created_at TEXT, updated_at TEXT)
+memories_fts  -- FTS5 over content, external content = memories (content_rowid = seq), trigger-synced
+memories_vec  -- sqlite-vec vec0(user_id text partition key, embedding float[N]), rowid = memories.seq
 ```
+
+`seq` is the stable rowid shared by the indexes (the implicit rowid of a TEXT-PK table can change
+on VACUUM); `id` is the public uuid. The vector table is optional: if sqlite-vec cannot load or no
+embedder is configured, retrieval degrades to FTS5 only.
 
 - Categories: `preference`, `interest`, `goal`, `project`, `personal_context`, `explicit`.
 - Retrieval = hybrid: FTS5 bm25 top-k ∪ vector top-k → reciprocal-rank fusion → top 5; always
