@@ -14,6 +14,7 @@ dependencies = [
     # F02 server deps below
     # F06 provider deps below
     # F12 memory/tools deps below
+    "sqlite-vec>=0.1.6",
 ]
 
 [project.optional-dependencies]
