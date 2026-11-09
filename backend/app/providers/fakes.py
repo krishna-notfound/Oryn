@@ -38,8 +38,10 @@ class FakeSpeechToTextStream(SpeechToTextStream):
 
     async def finish(self) -> None:
         await asyncio.sleep(self._delay)
+        self._started = (
+            False  # like the real provider, the stream stays open for the next utterance
+        )
         await self._queue.put(TranscriptEvent(self._transcript, is_final=True, language="en-IN"))
-        await self._queue.put(None)
 
     async def events(self) -> AsyncIterator[STTEvent]:
         while (event := await self._queue.get()) is not None:
