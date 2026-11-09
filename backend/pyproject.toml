@@ -15,6 +15,7 @@ dependencies = [
     # F06 provider deps below
     # F12 memory/tools deps below
     "sqlite-vec>=0.1.6",
+    "tzdata>=2024.1",  # zoneinfo database on Windows / slim images
 ]
 
 [project.optional-dependencies]
