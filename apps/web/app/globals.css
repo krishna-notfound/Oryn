@@ -1,0 +1,118 @@
+@import "tailwindcss";
+
+/* Tokens ported from design/stitch (Tailwind config shared by every screen) and DESIGN.md. */
+@theme {
+  --color-background: #faf8fe;
+  --color-surface: #faf8fe;
+  --color-surface-bright: #faf8fe;
+  --color-surface-dim: #dad9df;
+  --color-surface-container-lowest: #ffffff;
+  --color-surface-container-low: #f4f3f8;
+  --color-surface-container: #eeedf3;
+  --color-surface-container-high: #e9e7ed;
+  --color-surface-container-highest: #e3e2e7;
+  --color-surface-variant: #e3e2e7;
+  --color-surface-tint: #655497;
+  --color-on-surface: #1a1b1f;
+  --color-on-surface-variant: #494550;
+  --color-on-background: #1a1b1f;
+  --color-inverse-surface: #2f3034;
+  --color-inverse-on-surface: #f1f0f5;
+  --color-outline: #7a7581;
+  --color-outline-variant: #cac4d1;
+  --color-primary: #655497;
+  --color-on-primary: #ffffff;
+  --color-primary-container: #b8a5ef;
+  --color-on-primary-container: #493879;
+  --color-inverse-primary: #cebdff;
+  --color-primary-fixed: #e8ddff;
+  --color-primary-fixed-dim: #cebdff;
+  --color-on-primary-fixed: #200b4f;
+  --color-on-primary-fixed-variant: #4c3c7d;
+  --color-secondary: #4b6700;
+  --color-on-secondary: #ffffff;
+  --color-secondary-container: #c4ef67;
+  --color-on-secondary-container: #4f6c00;
+  --color-secondary-fixed: #c7f169;
+  --color-secondary-fixed-dim: #abd550;
+  --color-on-secondary-fixed: #141f00;
+  --color-on-secondary-fixed-variant: #384e00;
+  --color-tertiary: #605e58;
+  --color-on-tertiary: #ffffff;
+  --color-tertiary-container: #b3b0a9;
+  --color-on-tertiary-container: #44433e;
+  --color-tertiary-fixed: #e6e2da;
+  --color-tertiary-fixed-dim: #cac6bf;
+  --color-error: #ba1a1a;
+  --color-on-error: #ffffff;
+  --color-error-container: #ffdad6;
+  --color-on-error-container: #93000a;
+
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+
+  --spacing-gutter: 1rem;
+  --spacing-margin: 1.25rem;
+  --spacing-space-xs: 0.25rem;
+  --spacing-space-sm: 0.5rem;
+  --spacing-space-md: 1rem;
+  --spacing-space-lg: 1.5rem;
+  --spacing-space-xl: 2.25rem;
+
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-jakarta), ui-sans-serif, system-ui, sans-serif;
+
+  --animate-breathe: breathe 4.5s ease-in-out infinite;
+  --animate-ripple: ripple 2.6s ease-out infinite;
+  --animate-shimmer: shimmer 3.2s linear infinite;
+
+  @keyframes breathe {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.035); }
+  }
+  @keyframes ripple {
+    0% { transform: scale(0.92); opacity: 0.55; }
+    100% { transform: scale(1.45); opacity: 0; }
+  }
+  @keyframes shimmer {
+    to { transform: rotate(360deg); }
+  }
+}
+
+/* Typography roles from DESIGN.md. Family + size + line-height + weight travel together. */
+@utility type-headline-xl { font-family: var(--font-display); font-size: 40px; line-height: 48px; letter-spacing: -0.02em; font-weight: 700; }
+@utility type-headline-xl-mobile { font-family: var(--font-display); font-size: 30px; line-height: 38px; letter-spacing: -0.015em; font-weight: 700; }
+@utility type-headline-lg { font-family: var(--font-display); font-size: 32px; line-height: 40px; letter-spacing: -0.01em; font-weight: 600; }
+@utility type-headline-lg-mobile { font-family: var(--font-display); font-size: 24px; line-height: 32px; letter-spacing: -0.01em; font-weight: 600; }
+@utility type-headline-sm { font-family: var(--font-display); font-size: 20px; line-height: 28px; font-weight: 600; }
+@utility type-body-lg { font-family: var(--font-sans); font-size: 18px; line-height: 28px; font-weight: 400; }
+@utility type-body-md { font-family: var(--font-sans); font-size: 15px; line-height: 24px; font-weight: 400; }
+@utility type-body-sm { font-family: var(--font-sans); font-size: 13px; line-height: 20px; font-weight: 400; }
+@utility type-label-lg { font-family: var(--font-display); font-size: 15px; line-height: 20px; letter-spacing: 0.01em; font-weight: 600; }
+@utility type-label-md { font-family: var(--font-display); font-size: 13px; line-height: 18px; letter-spacing: 0.01em; font-weight: 600; }
+@utility type-label-sm { font-family: var(--font-display); font-size: 11px; line-height: 16px; letter-spacing: 0.02em; font-weight: 600; }
+
+/* Safe-area insets for notched phones. */
+@utility pt-safe { padding-top: env(safe-area-inset-top, 0px); }
+@utility pb-safe { padding-bottom: env(safe-area-inset-bottom, 0px); }
+
+/* Centred column: ~480px for voice screens, ~720px for chat. */
+@utility page-col { width: 100%; max-width: 480px; margin-inline: auto; }
+@utility page-col-wide { width: 100%; max-width: 720px; margin-inline: auto; }
+
+@layer base {
+  html, body { margin: 0; padding: 0; width: 100%; overflow-x: hidden; }
+  body {
+    background: var(--color-surface);
+    color: var(--color-on-surface);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--color-primary-fixed); color: var(--color-on-primary-fixed); }
+  button, a, [role="radio"], [role="switch"] { -webkit-tap-highlight-color: transparent; }
+  :focus-visible { outline: 3px solid rgb(184 165 239 / 0.55); outline-offset: 2px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+}
