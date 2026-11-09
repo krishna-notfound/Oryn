@@ -1,16 +1,21 @@
-"""WebSocket wire contract between the browser and the backend.
+"""WebSocket wire contract between the browser and the backend (protocol v2).
 
-Text frames carry the JSON messages below. Binary frames carry audio:
-  client -> server : raw PCM s16le mono at SessionReady.input_sample_rate
-  server -> client : 4-byte big-endian uint32 generation_id + PCM s16le
-                     at AssistantAudioStart.sample_rate
-The client drops any audio frame whose generation_id is not the current one,
-so stale audio can never play after a barge-in.
-Spec: docs/context/websocket-contract.md
+Text frames carry JSON. Client messages are `{"v": 2, "type": ..., ...}`. Every server event
+is wrapped in an envelope `{"v", "type", "session_id", "turn_id"?, "generation_id"?, "seq", "ts"}`
+followed by the event's own fields; `seq` counts events per session and `ts` is server epoch ms.
+
+Binary frames carry audio:
+  client -> server : raw PCM s16le mono at 16 kHz, at most MAX_AUDIO_FRAME_BYTES
+  server -> client : uint32 BE generation_id + uint32 BE seq (chunk index within the
+                     generation) + PCM s16le at AudioStarted.sample_rate
+The client drops any event or frame whose generation_id is not the current one, so stale
+audio can never play after a barge-in.
+Spec: docs/superpowers/specs/2026-11-09-realtime-pipeline-v2-design.md section 7
 """
 
 from __future__ import annotations
 
+import json
 import struct
 from typing import Annotated, Literal
 
@@ -18,9 +23,10 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from app.voice.state import VoiceState
 
+PROTOCOL_VERSION = 2
 MAX_AUDIO_FRAME_BYTES = 32_768
 MAX_TEXT_CHARS = 2_000
-AUDIO_HEADER = struct.Struct(">I")
+AUDIO_HEADER = struct.Struct(">II")
 
 
 class _Message(BaseModel):
@@ -30,7 +36,11 @@ class _Message(BaseModel):
 # ---------------------------------------------------------------- client -> server
 
 
-class SessionStart(_Message):
+class _ClientMessage(_Message):
+    v: Literal[2] = 2
+
+
+class SessionStart(_ClientMessage):
     type: Literal["session.start"] = "session.start"
     token: str = Field(min_length=1)
     language: str = "en-IN"
@@ -38,46 +48,66 @@ class SessionStart(_Message):
     conversation_id: str | None = None
 
 
-class UserText(_Message):
+class InputSpeechStarted(_ClientMessage):
+    type: Literal["input.speech_started"] = "input.speech_started"
+    ts: int | None = None
+
+
+class InputSpeechEnded(_ClientMessage):
+    type: Literal["input.speech_ended"] = "input.speech_ended"
+    ts: int | None = None
+
+
+class UserText(_ClientMessage):
     type: Literal["user.text"] = "user.text"
     text: str = Field(min_length=1, max_length=MAX_TEXT_CHARS)
 
 
-class UserInterrupt(_Message):
-    type: Literal["user.interrupt"] = "user.interrupt"
-
-
-class AudioEnd(_Message):
-    type: Literal["audio.end"] = "audio.end"
-
-
-class PlaybackStarted(_Message):
-    type: Literal["playback.started"] = "playback.started"
+class TurnCancel(_ClientMessage):
+    type: Literal["turn.cancel"] = "turn.cancel"
     generation_id: int
 
 
-class PlaybackFinished(_Message):
+class PlaybackStarted(_ClientMessage):
+    type: Literal["playback.started"] = "playback.started"
+    generation_id: int
+    client_latency_ms: float | None = None
+
+
+class PlaybackFinished(_ClientMessage):
     type: Literal["playback.finished"] = "playback.finished"
     generation_id: int
 
 
-class SessionEnd(_Message):
+class ClientTurnMetrics(_ClientMessage):
+    """What the browser measured; the server logs it next to its own marks."""
+
+    type: Literal["turn.metrics"] = "turn.metrics"
+    turn_id: int
+    generation_id: int
+    perceived_ms: float
+    playback_lead_ms: float
+
+
+class Heartbeat(_ClientMessage):
+    type: Literal["heartbeat"] = "heartbeat"
+
+
+class SessionEnd(_ClientMessage):
     type: Literal["session.end"] = "session.end"
-
-
-class Ping(_Message):
-    type: Literal["ping"] = "ping"
 
 
 ClientMessage = Annotated[
     SessionStart
+    | InputSpeechStarted
+    | InputSpeechEnded
     | UserText
-    | UserInterrupt
-    | AudioEnd
+    | TurnCancel
     | PlaybackStarted
     | PlaybackFinished
-    | SessionEnd
-    | Ping,
+    | ClientTurnMetrics
+    | Heartbeat
+    | SessionEnd,
     Field(discriminator="type"),
 ]
 client_message_adapter: TypeAdapter[ClientMessage] = TypeAdapter(ClientMessage)
@@ -91,93 +121,138 @@ def parse_client_message(raw: str | bytes) -> ClientMessage:
 # ---------------------------------------------------------------- server -> client
 
 
-class SessionReady(_Message):
+class _ServerEvent(_Message):
+    """Payload of one server event. `turn_id` / `generation_id` move into the envelope."""
+
+    turn_id: int | None = None
+    generation_id: int | None = None
+
+
+class SessionReady(_ServerEvent):
     type: Literal["session.ready"] = "session.ready"
-    session_id: str
     conversation_id: str
     input_sample_rate: int
     output_sample_rate: int
+    protocol: Literal[2] = 2
 
 
-class StateChanged(_Message):
+class StateChanged(_ServerEvent):
     type: Literal["state"] = "state"
     state: VoiceState
 
 
-class TranscriptPartial(_Message):
-    type: Literal["transcript.partial"] = "transcript.partial"
-    text: str
-
-
-class TranscriptFinal(_Message):
+class TranscriptFinal(_ServerEvent):
     type: Literal["transcript.final"] = "transcript.final"
-    turn_id: int
     text: str
     language: str | None = None
 
 
-class AssistantText(_Message):
-    type: Literal["assistant.text"] = "assistant.text"
-    generation_id: int
+class LlmStarted(_ServerEvent):
+    type: Literal["llm.started"] = "llm.started"
+
+
+class TextDelta(_ServerEvent):
+    type: Literal["text.delta"] = "text.delta"
     delta: str
 
 
-class AssistantAudioStart(_Message):
-    type: Literal["assistant.audio.start"] = "assistant.audio.start"
-    generation_id: int
+class TextSegment(_ServerEvent):
+    type: Literal["text.segment"] = "text.segment"
+    index: int
+    text: str
+
+
+class AudioStarted(_ServerEvent):
+    type: Literal["audio.started"] = "audio.started"
     sample_rate: int
     encoding: Literal["pcm_s16le"] = "pcm_s16le"
 
 
-class AssistantDone(_Message):
-    type: Literal["assistant.done"] = "assistant.done"
-    generation_id: int
+class AudioCompleted(_ServerEvent):
+    type: Literal["audio.completed"] = "audio.completed"
+
+
+class TurnCompleted(_ServerEvent):
+    type: Literal["turn.completed"] = "turn.completed"
     text: str
 
 
-class Interrupted(_Message):
-    type: Literal["interrupted"] = "interrupted"
-    generation_id: int
+class TurnCancelled(_ServerEvent):
+    type: Literal["turn.cancelled"] = "turn.cancelled"
+    reason: str
+    heard_text: str
 
 
-class TurnMetrics(_Message):
-    """All durations in milliseconds; None when the stage did not run."""
+class TurnMetrics(_ServerEvent):
+    """Server-side marks of one turn. Durations in milliseconds; None when the stage did not run."""
 
-    type: Literal["metrics"] = "metrics"
-    turn_id: int
-    generation_id: int
+    type: Literal["turn.metrics"] = "turn.metrics"
     stt_ms: float | None = None
     llm_ttft_ms: float | None = None
+    segmentation_ms: float | None = None
+    tts_slot_wait_ms: float | None = None
     tts_ttfb_ms: float | None = None
+    server_first_audio_ms: float | None = None
     speech_end_to_first_audio_ms: float | None = None
     interrupt_to_stop_ms: float | None = None
 
 
-class ErrorEvent(_Message):
-    type: Literal["error"] = "error"
+class PipelineError(_ServerEvent):
+    type: Literal["pipeline.error"] = "pipeline.error"
     code: str
     message: str
     retryable: bool = False
 
 
-class Pong(_Message):
-    type: Literal["pong"] = "pong"
+class ServerHeartbeat(_ServerEvent):
+    type: Literal["heartbeat"] = "heartbeat"
 
 
 ServerEvent = (
     SessionReady
     | StateChanged
-    | TranscriptPartial
     | TranscriptFinal
-    | AssistantText
-    | AssistantAudioStart
-    | AssistantDone
-    | Interrupted
+    | LlmStarted
+    | TextDelta
+    | TextSegment
+    | AudioStarted
+    | AudioCompleted
+    | TurnCompleted
+    | TurnCancelled
     | TurnMetrics
-    | ErrorEvent
-    | Pong
+    | PipelineError
+    | ServerHeartbeat
 )
 
 
-def pack_audio_frame(generation_id: int, pcm: bytes) -> bytes:
-    return AUDIO_HEADER.pack(generation_id) + pcm
+class EventEnvelope(BaseModel):
+    """The envelope fields of any server event, for parsing what `encode_event` produced."""
+
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+    v: Literal[2]
+    type: str
+    session_id: str
+    turn_id: int | None = None
+    generation_id: int | None = None
+    seq: int
+    ts: int
+
+
+def encode_event(event: ServerEvent, *, session_id: str, seq: int, ts: int) -> str:
+    body = event.model_dump(mode="json")
+    envelope: dict[str, object] = {
+        "v": PROTOCOL_VERSION,
+        "type": body.pop("type"),
+        "session_id": session_id,
+    }
+    for key in ("turn_id", "generation_id"):
+        if (value := body.pop(key)) is not None:
+            envelope[key] = value
+    envelope["seq"] = seq
+    envelope["ts"] = ts
+    return json.dumps(envelope | body, ensure_ascii=False, separators=(",", ":"))
+
+
+def pack_audio_frame(generation_id: int, seq: int, pcm: bytes) -> bytes:
+    return AUDIO_HEADER.pack(generation_id, seq) + pcm

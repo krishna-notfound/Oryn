@@ -6,7 +6,7 @@ def feed_all(text: str, step: int = 3) -> tuple[list[str], str | None]:
     segmenter = SentenceSegmenter()
     out: list[str] = []
     for i in range(0, len(text), step):
-        out += segmenter.feed(text[i : i + step])
+        out += segmenter.feed(text[i : i + step], 0.0)
     return out, segmenter.flush()
 
 
@@ -18,8 +18,8 @@ def test_splits_on_sentence_terminators() -> None:
 
 def test_waits_for_whitespace_after_terminator() -> None:
     segmenter = SentenceSegmenter()
-    assert segmenter.feed("It is done.") == []
-    assert segmenter.feed(" Next") == ["It is done."]
+    assert segmenter.feed("It is done.", 0.0) == []
+    assert segmenter.feed(" Next", 0.0) == ["It is done."]
     assert segmenter.flush() == "Next"
 
 
@@ -52,13 +52,13 @@ def test_newline_ends_a_sentence() -> None:
     assert rest == "Second line"
 
 
-def test_first_chunk_flushes_early_at_comma_after_four_words() -> None:
+def test_first_chunk_flushes_early_at_a_clause_boundary() -> None:
     out, rest = feed_all("Well I think that, honestly, it is fine. ")
     assert out == ["Well I think that,", "honestly, it is fine."]
     assert rest is None
 
 
-def test_no_early_flush_before_four_words() -> None:
+def test_one_word_clause_is_not_flushed_alone() -> None:
     out, _ = feed_all("Well, honestly it is fine. ")
     assert out == ["Well, honestly it is fine."]
 
@@ -88,12 +88,79 @@ def test_strips_markdown_symbols() -> None:
 
 def test_flush_returns_none_when_nothing_speakable() -> None:
     segmenter = SentenceSegmenter()
-    segmenter.feed("  ** ")
+    segmenter.feed("  ** ", 0.0)
     assert segmenter.flush() is None
 
 
 def test_flush_resets_for_the_next_reply() -> None:
     segmenter = SentenceSegmenter()
-    segmenter.feed("It is fine.")
+    segmenter.feed("It is fine.", 0.0)
     assert segmenter.flush() == "It is fine."
-    assert segmenter.feed("aa bb cc dd, ee ff. ") == ["aa bb cc dd,", "ee ff."]
+    assert segmenter.feed("aa bb cc dd, ee ff gg. ", 0.0) == ["aa bb cc dd,", "ee ff gg."]
+
+
+# ---------------------------------------------------------------- v2 rules
+
+
+def test_first_flush_at_clause_once_next_word_started() -> None:
+    segmenter = SentenceSegmenter()
+    assert segmenter.feed("Haan bilkul, ", 0.0) == []  # the next word has not started yet
+    assert segmenter.feed("main", 0.0) == ["Haan bilkul,"]
+
+
+def test_time_based_first_flush_needs_two_words() -> None:
+    segmenter = SentenceSegmenter()
+    t0 = 100.0
+    assert segmenter.feed("Okay", t0) == []
+    assert segmenter.poll(t0 + 0.26) == []  # a single word is not worth a Timbre request
+    assert segmenter.feed(" so", t0 + 0.27) == []
+    assert segmenter.poll(t0 + 0.27) == ["Okay so"]
+
+
+def test_poll_flushes_first_segment_after_the_wait() -> None:
+    segmenter = SentenceSegmenter()
+    t0 = 100.0
+    segmenter.feed("Okay so", t0)
+    assert segmenter.deadline == t0 + 0.25
+    assert segmenter.poll(t0 + 0.2) == []
+    assert segmenter.poll(t0 + 0.26) == ["Okay so"]
+    assert segmenter.deadline is None  # only the first segment is timed
+    assert segmenter.poll(t0 + 5) == []
+
+
+def test_abbreviation_and_decimal_stay_in_one_segment() -> None:
+    out, rest = feed_all("Dr. Rao paid 3.5 lakh.")
+    assert out == [] and rest == "Dr. Rao paid 3.5 lakh."
+
+
+def test_long_text_is_split_at_a_space_within_the_limit() -> None:
+    segmenter = SentenceSegmenter()
+    out = segmenter.feed("word " * 40, 0.0)  # 200 chars, no punctuation
+    assert out and all(len(segment) <= 160 for segment in out)
+    assert " ".join(out + [segmenter.flush() or ""]).split() == ["word"] * 40
+
+
+def test_long_sentence_with_a_late_terminator_is_still_capped() -> None:
+    segmenter = SentenceSegmenter()
+    out = segmenter.feed("word " * 39 + "word. Next", 0.0)
+    assert all(len(segment) <= 160 for segment in out)
+    assert len(out) >= 2
+
+
+def test_short_sentence_merges_into_the_next_one() -> None:
+    segmenter = SentenceSegmenter()
+    assert segmenter.feed("Here is the plan for today. ", 0.0) == ["Here is the plan for today."]
+    assert segmenter.feed("Ok. Then we start with breakfast. ", 0.0) == [
+        "Ok. Then we start with breakfast."
+    ]
+
+
+def test_short_final_tail_is_emitted_by_flush() -> None:
+    segmenter = SentenceSegmenter()
+    segmenter.feed("Here is the plan for today. Ok. ", 0.0)
+    assert segmenter.flush() == "Ok."
+
+
+def test_devanagari_danda_is_a_boundary_for_the_first_segment() -> None:
+    segmenter = SentenceSegmenter()
+    assert segmenter.feed("मैं यहाँ हूँ। आप", 0.0) == ["मैं यहाँ हूँ।"]
