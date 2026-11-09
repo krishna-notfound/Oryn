@@ -1,0 +1,28 @@
+# env / secrets
+.env
+.env.*
+!.env.example
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+# node
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+# data
+*.db
+*.db-*
+data/
+# tooling
+.worktrees/
+.claude/settings.local.json
+*.zip
+coverage/
+.DS_Store
