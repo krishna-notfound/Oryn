@@ -71,6 +71,7 @@ MEMORY_BUDGET_S = 0.15  # recall is a bonus; never let it hold up the reply
 TOOL_TIMEOUT_S = 8.0
 HOOK_GRACE_S = 2.0  # how long close() lets persistence hooks finish before cancelling them
 HISTORY_LOAD_TIMEOUT_S = 1.5
+TTS_WARM_UP_TIMEOUT_S = 5.0
 RESUMED_HOLD_S = 1.5  # words kept for a continuation that never produces a transcript
 
 MessageHook = Callable[[str, str, bool], Awaitable[None]]
@@ -125,6 +126,7 @@ class VoiceConversation(Conversation):
         self._user = user
         self._mode = mode
         self._llm = llm
+        self._tts = tts
         self._sink = sink
         self._settings = settings
         self._memory = memory
@@ -168,14 +170,19 @@ class VoiceConversation(Conversation):
 
     async def start(self) -> None:
         await self._state.transition(VoiceState.LISTENING)
-        restore = asyncio.create_task(self._restore_history(), name="history-restore")
-        try:  # reconnecting to a conversation: the history loads while the STT socket opens
+        # While the STT socket opens (seconds), the history loads and the TTS socket warms up.
+        side_work = [
+            asyncio.create_task(self._restore_history(), name="history-restore"),
+            asyncio.create_task(self._warm_up_tts(), name="tts-warm-up"),
+        ]
+        try:
             if self._link is not None:
                 await self._link.start()
-            await restore
+            await asyncio.wait(side_work)
         finally:
-            restore.cancel()
-            await asyncio.wait({restore})
+            for task in side_work:
+                task.cancel()
+            await asyncio.wait(side_work)
 
     async def on_audio(self, chunk: bytes) -> None:
         if self._link is not None and self._state.state not in _DEAF_STATES:
@@ -251,6 +258,18 @@ class VoiceConversation(Conversation):
             return
         self._history.restore(stored)
         self._turns.resume_numbering(sum(1 for m in stored if m.role == "user"))
+
+    async def _warm_up_tts(self) -> None:
+        """Transports with a persistent socket open it now, so the first reply skips the
+        handshake. Optional: the plain HTTP transport has nothing to warm."""
+        warm_up = getattr(self._tts, "warm_up", None)
+        if self._mode != "voice" or warm_up is None:
+            return
+        try:
+            async with asyncio.timeout(TTS_WARM_UP_TIMEOUT_S):
+                await warm_up()
+        except Exception:  # the first reply connects on demand instead
+            log.warning("tts warm-up failed", exc_info=True)
 
     # ------------------------------------------------------------ speech-to-text
 

@@ -22,7 +22,7 @@ from app.main import create_app
 from app.persistence.conversations import InMemoryConversationRepository, StoredMessage
 from app.persistence.postgrest import PostgrestClient
 from app.providers.base import ChatMessage, LanguageModel, LLMChunk, ProviderError
-from app.providers.fakes import FakeLanguageModel
+from app.providers.fakes import FakeLanguageModel, FakeTextToSpeech
 from app.voice.state import VoiceState
 from app.websocket.protocol import PipelineError, TextDelta, TurnCompleted
 from app.wiring import OrynRuntime
@@ -244,3 +244,36 @@ async def test_history_loader_failure_does_not_break_the_call(harness: Harness) 
     await engine.start()
     await engine.on_text("hello")
     await sink.wait_for(lambda i: isinstance(i, TurnCompleted))
+
+
+class WarmableTTS(FakeTextToSpeech):
+    def __init__(self, *, fail: bool = False) -> None:
+        super().__init__(delay=0.001)
+        self.warmed = 0
+        self._fail = fail
+
+    async def warm_up(self) -> None:
+        self.warmed += 1
+        if self._fail:
+            raise ProviderError("timbre", "handshake refused", retryable=True)
+
+
+async def test_tts_with_a_persistent_socket_is_warmed_up_at_session_start(harness: Harness) -> None:
+    tts = WarmableTTS()
+    engine, _ = harness.build(tts=tts)
+    await engine.start()
+    assert tts.warmed == 1
+
+
+async def test_failed_warm_up_does_not_fail_the_session(harness: Harness) -> None:
+    tts = WarmableTTS(fail=True)
+    engine, sink = harness.build(tts=tts)
+    await engine.start()
+    assert sink.states == [S.LISTENING]
+
+
+async def test_text_sessions_do_not_warm_the_tts_socket(harness: Harness) -> None:
+    tts = WarmableTTS()
+    engine, _ = harness.build(mode="text", tts=tts)
+    await engine.start()
+    assert tts.warmed == 0
