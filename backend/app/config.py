@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     gnani_tts_voice: str = ""
     gnani_tts_sample_rate: int = 24_000
     gnani_tts_max_concurrent: int = Field(default=1, ge=1)  # simultaneous synth requests
+    gnani_tts_transport: Literal["ws", "sse"] = "sse"
+    gnani_tts_ws_url: str = "wss://api.vachana.ai/api/v1/tts"
 
     # Sarvam conversational LLM
     sarvam_api_key: SecretStr | None = None

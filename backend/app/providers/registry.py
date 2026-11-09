@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 import httpx
@@ -15,7 +16,8 @@ from app.providers.fakes import (
     FakeTextToSpeech,
 )
 from app.providers.gnani_prisma import GnaniPrismaSTT
-from app.providers.gnani_timbre import GnaniTimbreTTS
+from app.providers.gnani_timbre import GnaniTimbreTTS, account_slots
+from app.providers.gnani_timbre_ws import GnaniTimbreRealtimeTTS
 from app.providers.openai_embeddings import OpenAICompatibleEmbedder
 from app.providers.sarvam_llm import SarvamLanguageModel
 
@@ -30,9 +32,12 @@ class ProviderSet:
     llm: LanguageModel
     embedder: Embedder | None
     _clients: tuple[httpx.AsyncClient, ...] = field(default=(), repr=False)
+    _closers: tuple[Callable[[], Awaitable[None]], ...] = field(default=(), repr=False)
 
     async def aclose(self) -> None:
-        """Close the shared HTTP clients. Call once at application shutdown."""
+        """Close the shared HTTP clients and persistent sockets. Call once at shutdown."""
+        for closer in self._closers:
+            await closer()
         for client in self._clients:
             await client.aclose()
 
@@ -75,10 +80,21 @@ def build_providers(settings: Settings) -> ProviderSet:
         clients.append(embeddings_client)
         embedder = OpenAICompatibleEmbedder(settings, embeddings_client)
 
+    tts: TextToSpeech
+    closers: list[Callable[[], Awaitable[None]]] = []
+    slots = account_slots(settings)  # one account-wide limit, whichever transport runs
+    if settings.gnani_tts_transport == "ws":
+        realtime = GnaniTimbreRealtimeTTS(settings, slots=slots)
+        tts = realtime
+        closers.append(realtime.aclose)
+    else:
+        tts = GnaniTimbreTTS(settings, tts_client, slots=slots)
+
     return ProviderSet(
         stt=GnaniPrismaSTT(settings),
-        tts=GnaniTimbreTTS(settings, tts_client),
+        tts=tts,
         llm=SarvamLanguageModel(settings, llm_client),
         embedder=embedder,
         _clients=tuple(clients),
+        _closers=tuple(closers),
     )
