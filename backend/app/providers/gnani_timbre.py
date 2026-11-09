@@ -1,11 +1,11 @@
-"""Gnani Timbre text-to-speech over Server-Sent Events.
+"""Gnani Timbre text-to-speech over Server-Sent Events (the default transport).
 
-Transport choice: SSE over one long-lived pooled `httpx.AsyncClient`, not the TTS WebSocket.
-Keep-alive removes the per-sentence TLS handshake, and every synthesis is an independent
-request, so cancelling one (barge-in) just closes its response. The WebSocket has no cancel
-message, so aborting mid-synthesis would mean dropping the socket (a fresh handshake) or
-draining stale audio, and the docs recommend one request at a time per socket anyway. They
-also contradict themselves on whether config goes in upgrade headers or the JSON body.
+SSE over one long-lived pooled `httpx.AsyncClient`: keep-alive removes the per-sentence TLS
+handshake, and every synthesis is an independent request, so cancelling one (barge-in) just
+closes its response. The persistent-WebSocket alternative lives in `gnani_timbre_ws.py`
+(`GNANI_TTS_TRANSPORT=ws`); the live A/B (`scripts/tts_ab.py`) found no reliable TTFB win for it
+and a slower recovery after barge-in (the socket must be dropped and re-handshaken).
+Both transports share one account-wide slot semaphore (`account_slots`).
 """
 
 from __future__ import annotations
@@ -38,6 +38,44 @@ def strip_wav_header(data: bytes) -> bytes:
     return data[marker + 8 :] if marker != -1 else b""
 
 
+def account_slots(settings: Settings) -> asyncio.Semaphore:
+    """The account-wide synthesis slots, shared by both transports. The account answers 429 to
+    a second simultaneous request (seen live), so requests queue here instead of failing."""
+    return asyncio.Semaphore(settings.gnani_tts_max_concurrent)
+
+
+def request_body(
+    settings: Settings, fmt: AudioFormat, text: str, language: str, voice: str | None
+) -> dict[str, Any]:
+    """The JSON synthesis request; identical for SSE and WebSocket (verified live)."""
+    return {
+        "text": text,
+        "model": settings.gnani_tts_model,  # always explicit: the API rejects the SDK default
+        "voice": voice or settings.gnani_tts_voice,
+        "language": language,
+        "audio_config": {
+            "sample_rate": fmt.sample_rate,
+            "num_channels": fmt.channels,
+            "sample_width": 2,
+            "encoding": "linear_pcm",
+            "container": "raw",
+        },
+    }
+
+
+class SampleAligner:
+    """Re-aligns arbitrary byte chunks to whole 16-bit samples, carrying the odd byte over."""
+
+    def __init__(self) -> None:
+        self._spare = b""
+
+    def push(self, data: bytes) -> bytes:
+        data = self._spare + data
+        cut = len(data) - len(data) % 2
+        data, self._spare = data[:cut], data[cut:]
+        return data
+
+
 class GnaniTimbreTTS(TextToSpeech):
     name = NAME
 
@@ -46,15 +84,14 @@ class GnaniTimbreTTS(TextToSpeech):
         settings: Settings,
         client: httpx.AsyncClient,
         backoff: Sequence[float] = RETRY_BACKOFF_S,
+        slots: asyncio.Semaphore | None = None,
     ) -> None:
         if settings.gnani_api_key is None:
             raise ValueError("GNANI_API_KEY is required for Gnani Timbre")
         self._settings = settings
         self._client = client
         self._backoff = tuple(backoff)
-        # The account answers 429 to a second simultaneous request (seen live), so synthesis
-        # requests queue here instead of failing and retrying with a backoff.
-        self._slots = asyncio.Semaphore(settings.gnani_tts_max_concurrent)
+        self._slots = slots or account_slots(settings)
         self._url = f"{settings.gnani_base_url.rstrip('/')}/api/v1/tts/sse"
         self._headers = {"X-API-Key-ID": settings.gnani_api_key.get_secret_value()}
         self.output_format = AudioFormat(sample_rate=settings.gnani_tts_sample_rate)
@@ -80,23 +117,10 @@ class GnaniTimbreTTS(TextToSpeech):
             await asyncio.sleep(delay)
 
     def _request_body(self, text: str, language: str, voice: str | None) -> dict[str, Any]:
-        s = self._settings
-        return {
-            "text": text,
-            "model": s.gnani_tts_model,  # always explicit: the API rejects the SDK default
-            "voice": voice or s.gnani_tts_voice,
-            "language": language,
-            "audio_config": {
-                "sample_rate": self.output_format.sample_rate,
-                "num_channels": self.output_format.channels,
-                "sample_width": 2,
-                "encoding": "linear_pcm",
-                "container": "raw",
-            },
-        }
+        return request_body(self._settings, self.output_format, text, language, voice)
 
     async def _stream_once(self, body: dict[str, Any]) -> AsyncGenerator[bytes]:
-        spare = b""  # a chunk boundary must not split a 16-bit sample
+        aligner = SampleAligner()  # a chunk boundary must not split a 16-bit sample
         try:
             async with self._client.stream(
                 "POST", self._url, json=body, headers=self._headers
@@ -109,8 +133,7 @@ class GnaniTimbreTTS(TextToSpeech):
                         raise ProviderError(NAME, str(payload.get("message", "stream error")))
                     if not payload.get("audio"):  # `start` and `complete` events carry no audio
                         continue
-                    pcm = spare + strip_wav_header(base64.b64decode(payload["audio"]))
-                    pcm, spare = pcm[: len(pcm) - len(pcm) % 2], pcm[len(pcm) - len(pcm) % 2 :]
+                    pcm = aligner.push(strip_wav_header(base64.b64decode(payload["audio"])))
                     if pcm:
                         yield pcm
         except httpx.TransportError as exc:
