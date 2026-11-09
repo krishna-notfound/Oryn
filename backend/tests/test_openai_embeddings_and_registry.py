@@ -25,11 +25,12 @@ def make_embedder(handler: httpx.MockTransport) -> OpenAICompatibleEmbedder:
         embeddings_base_url="https://emb.example/v1/",
         embeddings_api_key="emb-key",
         embeddings_model="text-embed",
+        embeddings_dimensions=3,
     )
     return OpenAICompatibleEmbedder(cfg, httpx.AsyncClient(transport=handler))
 
 
-async def test_embeds_in_input_order_and_learns_dimensions() -> None:
+async def test_embeds_in_input_order_with_declared_dimensions() -> None:
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -41,7 +42,7 @@ async def test_embeds_in_input_order_and_learns_dimensions() -> None:
         return httpx.Response(200, json={"data": rows})
 
     embedder = make_embedder(httpx.MockTransport(handler))
-    assert embedder.dimensions == 0
+    assert embedder.dimensions == 3
     vectors = await embedder.embed(["a", "b"])
 
     assert vectors == [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
@@ -49,6 +50,15 @@ async def test_embeds_in_input_order_and_learns_dimensions() -> None:
     assert str(seen[0].url) == "https://emb.example/v1/embeddings"
     assert seen[0].headers["authorization"] == "Bearer emb-key"
     assert json.loads(seen[0].content) == {"model": "text-embed", "input": ["a", "b"]}
+
+
+async def test_rejects_vectors_of_unexpected_size() -> None:
+    rows = [{"index": 0, "embedding": [1.0, 0.0]}]
+    embedder = make_embedder(
+        httpx.MockTransport(lambda _: httpx.Response(200, json={"data": rows}))
+    )
+    with pytest.raises(ProviderError, match="2-d vectors"):
+        await embedder.embed(["a"])
 
 
 async def test_embedding_errors_map_to_provider_error() -> None:
@@ -102,7 +112,22 @@ async def test_live_mode_builds_the_embedder_when_configured() -> None:
             sarvam_api_key="s",
             embeddings_base_url="https://emb.example/v1",
             embeddings_model="m",
+            embeddings_dimensions=768,
         )
     )
     assert isinstance(providers.embedder, OpenAICompatibleEmbedder)
+    assert providers.embedder.dimensions == 768
     await providers.aclose()
+
+
+def test_live_mode_requires_embedding_dimensions_with_embeddings() -> None:
+    with pytest.raises(RuntimeError, match="EMBEDDINGS_DIMENSIONS"):
+        build_providers(
+            settings(
+                gnani_api_key="g",
+                gnani_tts_voice="Nalini",
+                sarvam_api_key="s",
+                embeddings_base_url="https://emb.example/v1",
+                embeddings_model="m",
+            )
+        )

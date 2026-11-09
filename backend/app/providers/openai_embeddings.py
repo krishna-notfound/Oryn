@@ -26,8 +26,8 @@ class OpenAICompatibleEmbedder(Embedder):
             if settings.embeddings_api_key
             else {}
         )
-        # The vendor decides the vector size; it is learned from the first response.
-        self.dimensions = 0
+        # Declared up front: the memory store sizes its vector index from it at startup.
+        self.dimensions = settings.embeddings_dimensions
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         if not texts:
@@ -44,5 +44,8 @@ class OpenAICompatibleEmbedder(Embedder):
         vectors = [row["embedding"] for row in rows]
         if len(vectors) != len(texts):
             raise ProviderError(NAME, f"expected {len(texts)} embeddings, got {len(vectors)}")
-        self.dimensions = len(vectors[0])
+        if len(vectors[0]) != self.dimensions:
+            raise ProviderError(
+                NAME, f"model returned {len(vectors[0])}-d vectors, configured {self.dimensions}"
+            )
         return vectors
