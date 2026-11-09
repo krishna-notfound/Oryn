@@ -38,11 +38,13 @@ class ProviderSet:
 
 
 def _missing_env(settings: Settings) -> list[str]:
-    required = {
+    required: dict[str, object] = {
         "GNANI_API_KEY": settings.gnani_api_key,
         "GNANI_TTS_VOICE": settings.gnani_tts_voice,
         "SARVAM_API_KEY": settings.sarvam_api_key,
     }
+    if settings.embeddings_base_url and settings.embeddings_dimensions <= 0:
+        required["EMBEDDINGS_DIMENSIONS"] = None
     return [name for name, value in required.items() if not value]
 
 

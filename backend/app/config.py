@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     embeddings_base_url: str = ""
     embeddings_api_key: SecretStr | None = None
     embeddings_model: str = ""
+    embeddings_dimensions: int = 0  # must match the model; sizes the vector index
 
     # Memory
     memory_db_path: Path = Path("./data/memory.db")

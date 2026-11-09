@@ -270,14 +270,6 @@ def test_health_reports_active_sessions(harness: Harness) -> None:
             assert client.get("/health").json() == {"status": "ok", "active_sessions": 1}
 
 
-def test_module_level_app_imports_without_env_and_rejects_all_tokens() -> None:
-    from app.main import app
-
-    with TestClient(app) as client, client.websocket_connect("/ws") as ws:
-        ws.send_text(start_message())
-        assert close_code(ws) == 4401  # nothing configured: every token is rejected
-
-
 class _BrokenSocket:
     def __init__(self) -> None:
         self.attempts = 0

@@ -28,6 +28,7 @@ from app.config import Settings
 from app.conversation.ports import Conversation, EventSink, UserContext
 from app.persistence.conversations import ConversationRepository
 from app.persistence.postgrest import PersistenceError
+from app.providers.base import ProviderError
 from app.websocket.protocol import (
     MAX_AUDIO_FRAME_BYTES,
     AudioEnd,
@@ -202,7 +203,15 @@ class VoiceSession:
                 output_sample_rate=svc.settings.gnani_tts_sample_rate,
             )
         )
-        await conversation.start()
+        try:
+            await conversation.start()
+        except ProviderError as exc:
+            log.warning("conversation failed to start", extra={"provider": exc.provider})
+            await self._fail(
+                CloseCode.INTERNAL_ERROR,
+                "provider_unavailable",
+                "Voice service is unavailable, please retry.",
+            )
         log.info("session started", extra={"session_id": self.session_id, "user_id": user.user_id})
         return conversation
 

@@ -45,6 +45,7 @@ def _to_context(user_id: str, row: dict[str, Any]) -> UserContext:
         response_length=length if length in ("short", "detailed") else defaults.response_length,
         listen_first=row.get("listen_first", defaults.listen_first),
         memory_enabled=row.get("memory_enabled", defaults.memory_enabled),
+        save_history=row.get("save_history", defaults.save_history),
         timezone=row.get("timezone") or defaults.timezone,
         interests=tuple(row.get("interests") or ()),
     )

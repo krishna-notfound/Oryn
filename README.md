@@ -19,7 +19,7 @@ the whole chain (STT/LLM/TTS) and drops stale audio via a per-turn generation id
  Browser (Next.js on Vercel)                       Backend (FastAPI, Docker on EC2 ap-south-1)
  +--------------------------+                      +----------------------------------------+
  | Supabase Auth            |                      | Caddy  :443 (auto HTTPS)               |
- | AudioWorklet mic capture |   wss:// /ws         |   -> FastAPI app.main:app              |
+ | AudioWorklet mic capture |   wss:// /ws         |   -> FastAPI app.main                 |
  | playback queue + VAD     | <------------------> |      websocket/  session + protocol    |
  +--------------------------+  JSON + binary audio |      conversation/ engine, context     |
                                                    |      voice/  state machine, barge-in   |
@@ -53,7 +53,7 @@ cd backend
 python -m venv .venv && source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 cp .env.example .env                                     # PROVIDER_MODE=fake runs offline, no keys
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:build_app --factory --reload --port 8000
 pytest -q -m "not live"
 ```
 

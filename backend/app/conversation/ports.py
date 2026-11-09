@@ -27,6 +27,7 @@ class UserContext:
     response_length: Literal["short", "detailed"] = "short"
     listen_first: bool = True
     memory_enabled: bool = False
+    save_history: bool = True
     timezone: str = "Asia/Kolkata"
     interests: tuple[str, ...] = field(default=())
 
