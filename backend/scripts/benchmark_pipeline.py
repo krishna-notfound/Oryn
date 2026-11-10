@@ -281,6 +281,13 @@ async def stream_utterance(ws: ClientConnection, player: Player, pcm: bytes) -> 
     await ws.send(json.dumps({"v": 2, "type": "input.speech_ended"}))
 
 
+async def send_heartbeats(ws: ClientConnection) -> None:
+    """Like the browser: without traffic between turns the server closes the session as idle."""
+    while True:
+        await asyncio.sleep(15)
+        await ws.send(json.dumps({"v": 2, "type": "heartbeat"}))
+
+
 async def run_scenario(
     url: str, token: str, scenario: Scenario, audio: list[bytes], turns: int
 ) -> list[TurnResult]:
@@ -288,6 +295,7 @@ async def run_scenario(
     async with connect(url, max_size=None, max_queue=None) as ws:
         player = Player(ws)
         pump = asyncio.create_task(player.pump())
+        heartbeat = asyncio.create_task(send_heartbeats(ws), name="heartbeat")
         await ws.send(
             json.dumps(
                 {
@@ -319,6 +327,7 @@ async def run_scenario(
             results.append(player.result)
             await asyncio.sleep(0.3)
         await ws.send(json.dumps({"v": 2, "type": "session.end"}))
+        heartbeat.cancel()
         pump.cancel()
     return results
 
