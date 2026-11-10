@@ -168,6 +168,30 @@ class AudioStarted(_ServerEvent):
     encoding: Literal["pcm_s16le"] = "pcm_s16le"
 
 
+class AudioSegment(_ServerEvent):
+    """Sent just before the first audio chunk of a speakable segment so the client can align
+    captions with playback: chunks with seq >= first_seq belong to it until the next segment."""
+
+    type: Literal["audio.segment"] = "audio.segment"
+    index: int
+    text: str
+    first_seq: int
+
+
+class AudioSegmentDone(_ServerEvent):
+    """All audio for segment `index` has been sent; `samples` is its exact length."""
+
+    type: Literal["audio.segment_done"] = "audio.segment_done"
+    index: int
+    samples: int
+
+
+class TurnResume(_ServerEvent):
+    """The user's overlapping speech was only a backchannel ("haan", "hmm"): keep speaking."""
+
+    type: Literal["turn.resume"] = "turn.resume"
+
+
 class AudioCompleted(_ServerEvent):
     type: Literal["audio.completed"] = "audio.completed"
 
@@ -216,6 +240,9 @@ ServerEvent = (
     | TextDelta
     | TextSegment
     | AudioStarted
+    | AudioSegment
+    | AudioSegmentDone
+    | TurnResume
     | AudioCompleted
     | TurnCompleted
     | TurnCancelled

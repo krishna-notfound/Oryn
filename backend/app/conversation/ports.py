@@ -21,13 +21,14 @@ class UserContext:
 
     user_id: str
     preferred_name: str | None = None
-    language: str = "en-IN"
+    language: str = "en-IN"  # a Prisma/Timbre code, or "auto" to detect per utterance
     extra_languages: tuple[str, ...] = ()
     style: str = "friendly"  # friendly | playful | calm | thoughtful | direct
     response_length: Literal["short", "detailed"] = "short"
     listen_first: bool = True
     memory_enabled: bool = False
     save_history: bool = True
+    voice: str | None = None  # Timbre voice name; resolved per language by voice.catalog
     timezone: str = "Asia/Kolkata"
     interests: tuple[str, ...] = field(default=())
 
