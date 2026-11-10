@@ -67,6 +67,7 @@ async def test_profile_row_maps_to_user_context() -> None:
         "save_history": False,
         "timezone": "Asia/Dubai",
         "interests": ["cricket"],
+        "voice": "Nalini",
     }
     context = await ProfileRepository(_client(_Recorder(body=[row]).transport)).load(USER)
     assert context == UserContext(
@@ -81,7 +82,21 @@ async def test_profile_row_maps_to_user_context() -> None:
         save_history=False,
         timezone="Asia/Dubai",
         interests=("cricket",),
+        voice="Nalini",
     )
+
+
+async def test_auto_primary_language_becomes_auto_detect_and_blank_voice_is_none() -> None:
+    row = {"primary_language": "auto", "voice": None}
+    context = await ProfileRepository(_client(_Recorder(body=[row]).transport)).load(USER)
+    assert context.language == "auto"
+    assert context.voice is None
+
+
+async def test_profile_request_selects_the_voice_column() -> None:
+    recorder = _Recorder()
+    await ProfileRepository(_client(recorder.transport)).load(USER)
+    assert "voice" in recorder.requests[0].url.params["select"].split(",")
 
 
 async def test_missing_profile_row_yields_defaults() -> None:

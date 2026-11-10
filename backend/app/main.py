@@ -23,6 +23,7 @@ from app.persistence.conversations import (
     PostgrestConversationRepository,
 )
 from app.persistence.postgrest import PostgrestClient
+from app.voice.api import build_voice_router
 from app.voice.latency import latency_stats
 from app.websocket.session import (
     ConversationFactory,
@@ -142,6 +143,9 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         postgrest=postgrest,
         conversations=conversations,
         authenticator=authenticator,
-        routers=[build_memory_router(runtime.memory, user_id_from_token)],
+        routers=[
+            build_memory_router(runtime.memory, user_id_from_token),
+            build_voice_router(runtime.providers.tts, user_id_from_token),
+        ],
         on_shutdown=[runtime.aclose],
     )
