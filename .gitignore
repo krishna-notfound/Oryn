@@ -37,3 +37,6 @@ CLAUDE.md
 # private keys — never commit
 *.pem
 *.key
+
+# local browser-automation artefacts
+.playwright-mcp/
