@@ -21,7 +21,7 @@
 **Built for the Gnani AI Internship Challenge.** Speak naturally in English, Hindi, Hinglish or any of
 ten Indian languages, interrupt whenever you like, and hear Oryn answer while it is still thinking.
 
-[Live demo](https://oryn.app.builtbykrishna.dev) • [How it works](#-how-a-turn-flows) •
+[Live demo](https://oryn-voice.vercel.app) • [How it works](#-how-a-turn-flows) •
 [Engineering](#-engineering-deep-dive) • [Performance](#-performance) • [Quick start](#-quick-start) •
 [Contributing](#-contributing)
 
@@ -181,7 +181,38 @@ tool-call accumulation and reasoning disabled for latency. Everything else depen
 
 All numbers below were **measured live** against the real providers with
 `backend/scripts/benchmark_pipeline.py`, which synthesises English, Hindi and Hinglish speech, streams it
-into the running server at real-time cadence, and simulates the browser.
+into the running server at real-time cadence, and simulates the browser. "Perceived" is measured on the
+client: from the end of the user's speech (including the 250 ms the VAD needs to be sure) to the first
+audio frame of the reply.
+
+### Result: production, optimised pipeline (2 runs, 18 turns, EN / HI / Hinglish)
+
+```
++------------------------------------------------------------------+
+|        END OF SPEECH -> FIRST AUDIO (p50)   before  ->  after      |
++------------------------------------------------------------------+
+|  Perceived (client)      ████████████████████  2.15-2.38 s       |
+|                          ███████░░░░░░░░░░░░░  0.77-0.82 s  -65% |
+|  Server pipeline         ██████████████████░░  1.55-1.79 s       |
+|                          ████░░░░░░░░░░░░░░░░  0.39-0.45 s  -73% |
+|  p95 perceived           3.2-6.7 s  ->  0.92-1.12 s              |
++------------------------------------------------------------------+
+```
+
+| Stage (p50) | v1 | optimised | Where the gain came from |
+| :--- | :---: | :---: | :--- |
+| Speech end → transcript (client) | 1.08–1.20 s | **0.51–0.55 s** | client VAD → Prisma `commit` (engineering) |
+| LLM time to first token | 356–362 ms | 89–104 ms | speculative start + Sarvam variance |
+| Timbre time to first byte | 862–1034 ms | 155–172 ms | warm-up + mostly provider variance (see A/B) |
+| Server: speech end → first audio | 1.55–1.79 s | **387–449 ms** | overlap of all stages |
+| **Perceived: speech end → first audio** | **2.15–2.38 s** | **774–815 ms** | |
+| Interrupt → server stop | 4–10 ms | **1 ms** | synchronous cancel fence |
+| Stale audio frames after interrupt | 0 | **0** | generation-id fence |
+
+> Honest note: provider speed varies a lot day to day (Timbre's TTFB ranged 263–899 ms p50 across one
+> afternoon). The endpointing and pipeline-overlap gains are ours and repeatable; part of the TTS and LLM
+> improvement on the measurement day is provider variance. That is exactly why the benchmark reports
+> every stage separately.
 
 ### Baseline: first working pipeline (v1)
 
