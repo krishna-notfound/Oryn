@@ -1,3 +1,5 @@
+import { AUTO_LABEL, AUTO_LANGUAGE } from "./voices";
+
 /** Mirrors the `profiles` table in docs/context/data-and-memory.md. */
 
 /** Languages supported by both Gnani Prisma (STT) and Gnani Timbre (TTS). */
@@ -17,6 +19,7 @@ export const LANGUAGES = [
 export type LanguageCode = (typeof LANGUAGES)[number]["code"];
 
 export function languageLabel(code: string): string {
+  if (code === AUTO_LANGUAGE) return AUTO_LABEL;
   const language = LANGUAGES.find((entry) => entry.code === code);
   return language ? `${language.name} (${language.native})` : code;
 }
