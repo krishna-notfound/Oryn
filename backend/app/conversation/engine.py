@@ -38,6 +38,7 @@ from app.conversation.language import (
     is_auto,
     language_note,
     normalize_language,
+    settle_detected,
     turn_language,
 )
 from app.conversation.length import LongFormDetector
@@ -186,6 +187,7 @@ class VoiceConversation(Conversation):
         self._speech_end: float | None = None
         self._commit_sent: float | None = None
         self._prefix = ""  # words of a speculative turn dropped because the user kept talking
+        self._prefix_language: str | None = None  # language of the newest of those words
         self._prefix_task: asyncio.Task[None] | None = None
         self._last_language: str | None = None  # last language the STT detected (auto mode)
         self._cut_off: str | None = None  # what the user heard of a reply they talked over
@@ -330,6 +332,10 @@ class VoiceConversation(Conversation):
 
     async def _on_final(self, text: str, language: str | None) -> None:
         arrived = perf_counter()
+        if text and is_auto(self._user.language):
+            language = settle_detected(
+                language, text, previous=self._last_language, extras=self._user.extra_languages
+            )
         current = self._turns.current
         if self._arbiter.contested and current is not None and not current.speculative:
             if self._arbiter.judge(text, language) is Verdict.RESUME:
@@ -346,7 +352,7 @@ class VoiceConversation(Conversation):
             await self._turns.cancel("merged", current.generation_id)
         text = self._merge_prefix(text)
         if self._user_speaking:  # talking again already: wait for the rest
-            self._stash(text)
+            self._stash(text, language)
             return
         await self._start_turn(
             text,
@@ -388,11 +394,13 @@ class VoiceConversation(Conversation):
         if self._prefix:
             text = f"{self._prefix} {text}"
             self._prefix = ""
+            self._prefix_language = None
         self._cancel_prefix_flush()
         return text
 
-    def _stash(self, text: str) -> None:
+    def _stash(self, text: str, language: str | None) -> None:
         self._prefix = text
+        self._prefix_language = language  # the newest segment's, even if undetected
         self._schedule_prefix_flush()
 
     def _schedule_prefix_flush(self) -> None:
@@ -409,8 +417,9 @@ class VoiceConversation(Conversation):
         try:
             await asyncio.sleep(RESUMED_HOLD_S)
             text, self._prefix = self._prefix, ""
+            language, self._prefix_language = self._prefix_language, None
             if text:
-                await self._start_turn(text, speculative=False, from_voice=True)
+                await self._start_turn(text, speculative=False, from_voice=True, language=language)
         finally:
             if self._prefix_task is asyncio.current_task():
                 self._prefix_task = None

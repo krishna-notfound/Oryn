@@ -8,6 +8,7 @@ from app.conversation.language import (
     FALLBACK_LANGUAGE,
     language_note,
     normalize_language,
+    settle_detected,
     turn_language,
 )
 
@@ -49,3 +50,26 @@ def test_notes_name_the_language_and_script() -> None:
     assert language_note("en-IN") == "Reply in English (en-IN)."
     hindi = language_note("hi-IN")
     assert hindi.startswith("Reply in Hindi (hi-IN).") and "Hinglish" in hindi
+
+
+@pytest.mark.parametrize(
+    ("detected", "text", "previous", "extras", "expected"),
+    [
+        ("hi-IN", "ho ka", "mr-IN", (), "mr-IN"),  # short, and the user was speaking Marathi
+        ("hi-IN", "ho ka", None, ("mr-IN",), "mr-IN"),  # short, and they listed Marathi
+        ("hi-IN", "ho ka", None, ("mr",), "mr-IN"),
+        ("hi-IN", "ek do teen", "mr-IN", (), "mr-IN"),  # three words is still short
+        ("hi-IN", "aaj mausam bahut accha hai", "mr-IN", (), "hi-IN"),  # long enough to trust
+        ("hi-IN", "ho ka", "ta-IN", ("en-IN",), "hi-IN"),  # no Marathi in sight
+        ("ta-IN", "ho ka", "mr-IN", (), "ta-IN"),  # only Hindi is second-guessed
+        (None, "ho ka", "mr-IN", (), None),
+    ],
+)
+def test_short_hindi_segments_stay_marathi_for_marathi_speakers(
+    detected: str | None,
+    text: str,
+    previous: str | None,
+    extras: tuple[str, ...],
+    expected: str | None,
+) -> None:
+    assert settle_detected(detected, text, previous=previous, extras=extras) == expected

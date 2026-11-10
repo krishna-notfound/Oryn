@@ -560,3 +560,98 @@ def test_module_exposes_no_interrupted_marker() -> None:
 
     assert not hasattr(prompts, "INTERRUPTED_MARKER")
     assert not hasattr(engine_module, "INTERRUPTED_MARKER")
+
+
+# ---------------------------------------------------------------- segments of one utterance
+
+
+async def auto_engine(
+    harness: Harness, **user: Any
+) -> tuple[Any, ControlledSTT, RecordingSink, RecordingTTS, FakeLanguageModel]:
+    stt, tts = ControlledSTT(), RecordingTTS()
+    llm = FakeLanguageModel("Ji.", delay=0.001)
+    engine, sink = harness.build(
+        stt=stt,
+        tts=tts,
+        llm=llm,
+        user=UserContext(user_id="u1", language="auto", **user),
+        settings=settings(),
+    )
+    await engine.start()
+    return engine, stt, sink, tts, llm
+
+
+async def test_a_turn_merged_from_segments_takes_the_language_of_the_last_one(
+    harness: Harness,
+) -> None:
+    engine, stt, sink, tts, llm = await auto_engine(harness)
+    stt.streams[0].push(heard("namaste dost", "hi-IN"))  # speculative turn under way...
+    await asyncio.sleep(0.01)
+    stt.streams[0].push(heard("how are you today", "en-IN"))  # ...the user went on in English
+    await sink.wait_for(is_a(TurnCompleted))
+
+    assert [t.text for t in sink.of_type(TranscriptFinal)] == ["namaste dost how are you today"]
+    assert sink.of_type(TranscriptFinal)[0].language == "en-IN"
+    # (the dropped speculative turn may have synthesised ahead in Hindi; the audible turn did not)
+    assert tts.requests[-1][1] == "en-IN"
+    assert "Reply in English (en-IN)." in llm.calls[-1][0].content
+
+
+async def test_an_empty_last_segment_does_not_decide_the_language(harness: Harness) -> None:
+    engine, stt, sink, tts, _ = await auto_engine(harness)
+    stt.streams[0].push(heard("vanakkam nanba", "ta-IN"))
+    await asyncio.sleep(0.01)
+    stt.streams[0].push(heard("  ", "en-IN"))  # silence labelled with another language
+    await sink.wait_for(is_a(TurnCompleted))
+    assert {lang for _, lang, _ in tts.requests} == {"ta-IN"}
+
+
+async def test_stashed_segments_keep_their_language_until_the_turn_starts(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(engine_module, "RESUMED_HOLD_S", 0.02)
+    engine, stt, sink, tts, _ = await auto_engine(harness)
+    await engine.on_speech_started()
+    stt.streams[0].push(heard("vanakkam nanba", "ta-IN"))  # arrives while they talk on
+    await engine.on_speech_ended()
+    await sink.wait_for(is_a(TurnCompleted))
+    assert {lang for _, lang, _ in tts.requests} == {"ta-IN"}
+
+
+async def test_an_undetected_last_segment_falls_back_to_the_previous_turns_language(
+    harness: Harness,
+) -> None:
+    engine, stt, sink, tts, _ = await auto_engine(harness)
+    stt.streams[0].push(heard("vanakkam nanba", "te-IN"))
+    await sink.wait_for(is_a(TurnCompleted))
+    await engine.on_playback_finished(1)
+    await sink.wait_for_state(S.LISTENING, 2)
+    stt.streams[0].push(heard("sari", None))
+    await sink.wait_for(lambda i: isinstance(i, TurnCompleted) and i.generation_id == 2)
+    assert tts.requests[-1][1] == "te-IN"
+
+
+async def test_short_hindi_after_marathi_stays_marathi(harness: Harness) -> None:
+    engine, stt, sink, tts, llm = await auto_engine(harness)
+    stt.streams[0].push(heard("kasa kay aahe tumhi sagle", "mr-IN"))
+    await sink.wait_for(is_a(TurnCompleted))
+    await engine.on_playback_finished(1)
+    await sink.wait_for_state(S.LISTENING, 2)
+    stt.streams[0].push(heard("ho barobar", "hi-IN"))  # two words, detector says Hindi
+    await sink.wait_for(lambda i: isinstance(i, TurnCompleted) and i.generation_id == 2)
+    assert tts.requests[-1][1] == "mr-IN"
+    assert "Reply in Marathi (mr-IN)." in llm.calls[1][0].content
+
+
+async def test_a_listed_marathi_keeps_short_hindi_marathi_but_long_hindi_stays_hindi(
+    harness: Harness,
+) -> None:
+    engine, stt, sink, tts, _ = await auto_engine(harness, extra_languages=("mr-IN",))
+    stt.streams[0].push(heard("ho barobar", "hi-IN"))
+    await sink.wait_for(is_a(TurnCompleted))
+    assert tts.requests[-1][1] == "mr-IN"
+    await engine.on_playback_finished(1)
+    await sink.wait_for_state(S.LISTENING, 2)
+    stt.streams[0].push(heard("aaj mausam bahut accha hai yaar", "hi-IN"))
+    await sink.wait_for(lambda i: isinstance(i, TurnCompleted) and i.generation_id == 2)
+    assert tts.requests[-1][1] == "hi-IN"
