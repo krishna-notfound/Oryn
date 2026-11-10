@@ -146,7 +146,11 @@ class EchoLLM(LanguageModel):
     model = "echo"
 
     async def stream(
-        self, messages: list[ChatMessage] | tuple[ChatMessage, ...], tools: Any = ()
+        self,
+        messages: list[ChatMessage] | tuple[ChatMessage, ...],
+        tools: Any = (),
+        *,
+        max_tokens: int | None = None,
     ) -> Any:
         await asyncio.sleep(0.001)
         yield LLMChunk(text=f"You said {messages[-1].content}. ")

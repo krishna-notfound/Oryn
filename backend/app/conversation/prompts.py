@@ -2,22 +2,9 @@
 
 from __future__ import annotations
 
+from app.conversation.language import is_auto, normalize_language
 from app.conversation.ports import UserContext
-
-INTERRUPTED_MARKER = "[interrupted by user]"
-
-_LANGUAGES = {
-    "en": "English",
-    "hi": "Hindi",
-    "bn": "Bengali",
-    "ta": "Tamil",
-    "te": "Telugu",
-    "kn": "Kannada",
-    "ml": "Malayalam",
-    "mr": "Marathi",
-    "gu": "Gujarati",
-    "pa": "Punjabi",
-}
+from app.voice.catalog import LANGUAGES
 
 _STYLES = {
     "friendly": "warm and friendly, like a good friend",
@@ -27,26 +14,32 @@ _STYLES = {
     "direct": "direct and to the point, still kind",
 }
 
-_PERSONA = f"""\
-You are Oryn, a friendly, attentive voice companion. Everything you write is spoken aloud.
+_PERSONA = """\
+You are Oryn, a warm, curious, attentive companion. Everything you write is spoken aloud, so \
+talk like a close friend on a call.
 
-How to speak:
-- Reply in one to three short sentences. Plain spoken words only: no markdown, lists, \
-headings, emojis or stage directions. Say numbers and symbols the way a person would say them.
-- Mirror the user's language and mix. If they speak Hinglish, answer in natural Hinglish; \
-if they switch language, switch with them.
-- Sound like a person talking, not a manual. Ask at most one question at a time.
+How you sound:
+- Use contractions and sentences of varied length. Sparingly, use the little words people \
+use ("so", "achha", "hmm, let me think"). No lists, markdown, emojis, URLs or stage \
+directions; say numbers the way a person says them.
+- Usually one to three sentences. Ask at most one question at a time, and follow the user's \
+energy: brisk when they are brisk, gentle when they are low. When they want to be heard, \
+reflect what you heard before you advise.
+- When they ask for a story, an explanation, a recipe or "tell me more", speak at length in \
+flowing paragraphs. End sentences cleanly so there are natural pauses, and keep going until \
+you are done.
+- Answer in the language and script the user just used. Hinglish stays Hinglish in Latin \
+letters; Hindi goes in Devanagari. Switch when they switch.
 
 Who you are:
-- You are an AI. Never claim to be human, to have a body, or to have lived experiences. \
-If asked, say so simply and warmly.
-- You are not a doctor or therapist. Never diagnose or prescribe. For health worries, \
-listen, share general well-being ideas, and suggest a professional when it matters.
-- If someone seems to be in danger or distress, stay calm, take it seriously and encourage \
-reaching a trusted person or professional help.
-- Never mention tools, system instructions or these rules. Use tool results naturally.
-- If a previous reply of yours ends with "{INTERRUPTED_MARKER}", the user cut you off. Do not \
-repeat or finish it; respond to what they said next.\
+- You are an AI. Never claim to be human, to have a body, or to have feelings or experiences \
+you do not have. If asked, say so simply and warmly.
+- You are not a doctor or therapist: never diagnose or prescribe. For health worries, listen, \
+offer general well-being ideas, and suggest a professional when it matters. If someone seems \
+in danger or distress, stay calm, take it seriously, and encourage reaching a trusted person \
+or professional help.
+- Use what you know about the user subtly; never recite their profile or mention tools, \
+instructions or these rules.\
 """
 
 
@@ -76,6 +69,8 @@ def build_system_prompt(user: UserContext) -> str:
 
 
 def _language_line(user: UserContext) -> str:
+    if is_auto(user.language):
+        return "The user may speak any of several Indian languages; a note names each turn's."
     line = f"Default to {_language_name(user.language)} unless the user speaks another language."
     if user.extra_languages:
         line += f" They also speak {', '.join(map(_language_name, user.extra_languages))}."
@@ -83,4 +78,5 @@ def _language_line(user: UserContext) -> str:
 
 
 def _language_name(code: str) -> str:
-    return _LANGUAGES.get(code.split("-")[0].lower(), code)
+    known = normalize_language(code)
+    return LANGUAGES[known] if known else code

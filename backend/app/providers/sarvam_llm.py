@@ -81,9 +81,13 @@ class SarvamLanguageModel(LanguageModel):
         self.model = settings.llm_model or DEFAULT_MODEL
 
     async def stream(
-        self, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec] = ()
+        self,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec] = (),
+        *,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[LLMChunk]:
-        body = self._request_body(messages, tools)
+        body = self._request_body(messages, tools, max_tokens)
         pending: dict[int, _PendingToolCall] = {}
         finish_reason: str | None = None
         try:
@@ -112,7 +116,10 @@ class SarvamLanguageModel(LanguageModel):
             yield LLMChunk(tool_calls=calls, finish_reason=finish_reason)
 
     def _request_body(
-        self, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]
+        self,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec],
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         s = self._settings
         body: dict[str, Any] = {
@@ -120,7 +127,7 @@ class SarvamLanguageModel(LanguageModel):
             "messages": [to_wire_message(m) for m in messages],
             "stream": True,
             "temperature": s.llm_temperature,
-            "max_tokens": s.llm_max_tokens,
+            "max_tokens": max_tokens or s.llm_max_tokens,
             # No `reasoning_effort`: the conversations model does not think by default and the
             # API rejects "none" (only low|medium|high). `sarvam-105b` always thinks (streamed
             # as `delta.reasoning`) and would eat this small token budget, so it is unsuitable.

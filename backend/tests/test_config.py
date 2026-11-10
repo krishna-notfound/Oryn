@@ -16,3 +16,10 @@ def test_cors_origins_accept_bare_comma_separated_and_json(
 ) -> None:
     monkeypatch.setenv("CORS_ORIGINS", raw)
     assert Settings(_env_file=None).cors_origins == expected
+
+
+def test_long_conversation_defaults() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.llm_max_tokens == 400 and settings.llm_long_max_tokens == 1200
+    assert settings.session_max_duration_s == 3600
+    assert settings.contest_timeout_s == 3.0

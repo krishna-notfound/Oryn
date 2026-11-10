@@ -60,7 +60,11 @@ class SlowLLM(LanguageModel):
         self.finished = asyncio.Event()
 
     async def stream(
-        self, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec] = ()
+        self,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec] = (),
+        *,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[LLMChunk]:
         await asyncio.sleep(self.first_token_delay)
         for word in self.words:

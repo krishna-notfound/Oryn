@@ -130,9 +130,14 @@ class LanguageModel(ABC):
 
     @abstractmethod
     def stream(
-        self, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec] = ()
+        self,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec] = (),
+        *,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[LLMChunk]:
-        """Stream text deltas; tool calls arrive complete in a single chunk."""
+        """Stream text deltas; tool calls arrive complete in a single chunk. `max_tokens`
+        overrides the configured reply budget for this call."""
 
 
 # ---------------------------------------------------------------- embeddings
