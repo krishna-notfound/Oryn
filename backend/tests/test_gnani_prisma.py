@@ -109,6 +109,22 @@ async def test_sends_config_headers_exact_frames_and_maps_events() -> None:
     assert server.headers["x-idle-timeout-sec"] == "900"
 
 
+async def test_auto_language_opens_indic_auto_on_the_v3_model_and_reports_detection() -> None:
+    server = FakePrismaServer()
+    async with prisma(server.handle) as settings:
+        settings.gnani_stt_model = "prisma-v2.5"  # indic-auto exists only on v3.0
+        stream = await GnaniPrismaSTT(settings).open_stream("auto")
+        try:
+            await stream.send_audio(bytes(1024))
+            await stream.finish()
+            events = await take(stream.events(), 2)
+        finally:
+            await stream.close()
+    assert server.headers["language_code"] == "indic-auto"
+    assert server.headers["model"] == "prisma-v3.0"
+    assert events[1] == TranscriptEvent("namaste", is_final=True, language="hi-IN")
+
+
 async def test_finish_without_pending_audio_only_commits() -> None:
     server = FakePrismaServer()
     async with prisma(server.handle) as settings:

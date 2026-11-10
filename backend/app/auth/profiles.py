@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 
 _COLUMNS = (
     "preferred_name,primary_language,extra_languages,style,response_length,"
-    "listen_first,memory_enabled,save_history,timezone,interests"
+    "listen_first,memory_enabled,save_history,timezone,interests,voice"
 )
 
 
@@ -48,4 +48,5 @@ def _to_context(user_id: str, row: dict[str, Any]) -> UserContext:
         save_history=row.get("save_history", defaults.save_history),
         timezone=row.get("timezone") or defaults.timezone,
         interests=tuple(row.get("interests") or ()),
+        voice=row.get("voice") or None,
     )

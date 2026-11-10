@@ -30,6 +30,9 @@ from app.providers.base import (
 from app.providers.http import RETRYABLE_STATUSES
 
 NAME = "gnani-prisma"
+AUTO_LANGUAGE = "auto"  # session language meaning "detect per utterance"
+INDIC_AUTO = "indic-auto"  # Prisma's language_code for that; exists only on the v3.0 model
+AUTO_MODEL = "prisma-v3.0"
 FRAME_BYTES = 1024  # 512 samples; Prisma wants exactly this size per binary frame
 CONNECT_TIMEOUT_S = 5.0  # the upgrade alone takes 2-3 s
 MAX_IDLE_TIMEOUT_S = 900
@@ -195,10 +198,13 @@ class GnaniPrismaSTT(SpeechToText):
         self.input_format = AudioFormat(sample_rate=16_000)
 
     async def open_stream(self, language: str) -> SpeechToTextStream:
+        """`language` is a Prisma code (`hi-IN`) or `auto`: `indic-auto` on prisma-v3.0, where
+        each transcript carries its `detected_language_code` (as `TranscriptEvent.language`)."""
+        auto = language == AUTO_LANGUAGE
         headers = {
             "x-api-key-id": self._api_key,
-            "language_code": language,
-            "model": self._settings.gnani_stt_model,
+            "language_code": INDIC_AUTO if auto else language,
+            "model": AUTO_MODEL if auto else self._settings.gnani_stt_model,
             "x-sample-rate": str(self.input_format.sample_rate),
             "format": self._settings.gnani_stt_format,
             # Default is 60 s without a speech segment, after which Prisma errors and closes
