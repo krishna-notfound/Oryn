@@ -114,6 +114,38 @@ async def test_a_backchannel_resumes_the_reply_and_is_not_a_turn(
     assert spoken == len(LONG_REPLY.split()) * 640  # every word of the reply still played
 
 
+async def test_a_nod_split_into_several_final_segments_resumes_once(harness: Harness) -> None:
+    engine, stt, sink, llm = await start_speaking(harness)
+    await engine.on_speech_started()
+    stt.streams[0].push(final("haan"))
+    stt.streams[0].push(final("haan"))  # the same utterance, a second final segment
+    stt.streams[0].push(final("हाँ"))
+    await sink.wait_for(is_a(TurnCompleted))
+
+    assert len(sink.of_type(TurnResume)) == 1
+    assert len(llm.calls) == 1 and not sink.of_type(TurnCancelled)
+
+
+async def test_words_after_a_nod_in_the_same_utterance_still_interrupt(harness: Harness) -> None:
+    engine, stt, sink, _ = await start_speaking(harness)
+    await engine.on_speech_started()
+    stt.streams[0].push(final("haan"))
+    stt.streams[0].push(final("but wait, what about the rain"))
+    await sink.wait_for(is_a(TurnCancelled))
+    assert sink.of_type(TurnCancelled)[0].reason == "user_spoke"
+    assert len(sink.of_type(TurnResume)) == 1
+
+
+async def test_a_new_utterance_after_a_nod_is_judged_afresh(harness: Harness) -> None:
+    engine, stt, sink, _ = await start_speaking(harness)
+    await engine.on_speech_started()
+    stt.streams[0].push(final("haan"))
+    await sink.wait_for(is_a(TurnResume))
+    await engine.on_speech_started()  # they speak again, a different utterance
+    stt.streams[0].push(final("actually, stop"))
+    await sink.wait_for(is_a(TurnCancelled))
+
+
 async def test_a_resumed_reply_is_remembered_in_full(harness: Harness) -> None:
     engine, stt, sink, llm = await start_speaking(harness)
     await engine.on_speech_started()

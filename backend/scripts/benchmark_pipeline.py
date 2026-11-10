@@ -377,7 +377,7 @@ def print_summary(results: list[TurnResult]) -> None:
 # ---------------------------------------------------------------- human-conversation check
 
 STORY_REQUEST = "mujhe ek chhoti si kahani sunao"
-BACKCHANNEL = "haan"
+BACKCHANNEL = "haan haan"
 INTERRUPTION = "ruko ruko, mujhe kuch aur poochna hai, aaj ka mausam kaisa rehta hai?"
 NODS_AFTER_SEGMENTS = 3  # nod once this many caption segments of the story have arrived
 MENTIONS_INTERRUPTION = re.compile(
@@ -438,7 +438,8 @@ class Recorder:
     def dump(self, last: int = 25) -> None:
         """What the server sent most recently, to see why an expectation never came true."""
         print("  ... timed out; the last events were:")
-        for o in [o for o in self.log if o.kind == "event"][-last:]:
+        shown = [o for o in self.log if o.kind == "event" and o.body["type"] not in QUIET_EVENTS]
+        for o in shown[-last:]:
             detail = {k: v for k, v in o.body.items() if k in ("text", "reason", "state", "index")}
             print(f"    {o.body['type']} {detail}")
 
@@ -467,6 +468,9 @@ def saw(kind: str, since: int, count: int = 1) -> Callable[[list[Observed]], boo
     return lambda log: (
         sum(o.kind == "event" and o.body["type"] == kind for o in log[since:]) >= count
     )
+
+
+QUIET_EVENTS = frozenset({"text.delta", "text.segment", "heartbeat"})
 
 
 def check(label: str, ok: bool, detail: str = "") -> bool:

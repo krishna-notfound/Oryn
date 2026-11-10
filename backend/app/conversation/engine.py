@@ -190,6 +190,7 @@ class VoiceConversation(Conversation):
         self._prefix_language: str | None = None  # language of the newest of those words
         self._prefix_task: asyncio.Task[None] | None = None
         self._last_language: str | None = None  # last language the STT detected (auto mode)
+        self._nodding = False  # the overlap was a backchannel; more segments of it may follow
         self._cut_off: str | None = None  # what the user heard of a reply they talked over
         self._background: set[asyncio.Task[None]] = set()
         self._closed = False
@@ -337,12 +338,18 @@ class VoiceConversation(Conversation):
                 language, text, previous=self._last_language, extras=self._user.extra_languages
             )
         current = self._turns.current
-        if self._arbiter.contested and current is not None and not current.speculative:
+        overlap = self._arbiter.contested or self._nodding
+        if overlap and current is not None and not current.speculative:
+            # One utterance can arrive as several final segments ("haan", "haan"): each is judged.
             if self._arbiter.judge(text, language) is Verdict.RESUME:
-                await self._resume(current)
+                if not self._nodding:
+                    self._nodding = True
+                    await self._resume(current)
                 return
+            self._nodding = False
             await self._turns.cancel("user_spoke", current.generation_id)
         else:
+            self._nodding = False
             self._arbiter.clear()
         if not text:
             return
@@ -368,6 +375,7 @@ class VoiceConversation(Conversation):
         """The user is talking while a turn is in flight. An unconfirmed turn made no sound yet:
         drop it silently and keep its words. A heard one is only *contested* - the reply keeps
         going until the transcript says whether this was a nod or a real interruption."""
+        self._nodding = False  # a new stretch of speech
         turn = self._turns.current
         if turn is None:
             return
@@ -531,6 +539,7 @@ class VoiceConversation(Conversation):
         turn and never waits for the hooks. `by_user`: the user cut the reply short, so the
         next turn's prompt says what they heard of it (this note lasts exactly one turn)."""
         self._arbiter.clear()
+        self._nodding = False
         self._history.add_user(turn.user_text)
         self._history.add_assistant(heard)
         self._cut_off = heard if interrupted and by_user and heard else None
