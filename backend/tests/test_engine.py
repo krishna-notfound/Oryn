@@ -613,6 +613,30 @@ async def test_retryable_stt_error_reopens_the_stream_once(harness: Harness) -> 
     await sink.wait_for(is_a(TurnCompleted))
 
 
+async def test_a_long_lived_stream_ending_is_rotated_without_telling_the_user(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The provider caps a session at 15 minutes: that is routine, not an error."""
+    monkeypatch.setattr(stt_link_module, "STABLE_AFTER_S", 0.05)
+    stt = ControlledSTT()
+    engine, sink = harness.build(stt=stt)
+    await engine.start()
+    await asyncio.sleep(0.08)
+    stt.streams[0].push(ProviderError("prisma", "session limit", retryable=True))
+    for _ in range(200):
+        if len(stt.streams) == 2:
+            break
+        await asyncio.sleep(0.005)
+
+    assert len(stt.streams) == 2 and stt.streams[0].closed
+    assert sink.states == [S.LISTENING] and not sink.of_type(PipelineError)
+    await engine.on_audio(b"abc")
+    await asyncio.sleep(0.01)
+    assert stt.streams[1].audio == [b"abc"]
+    stt.streams[1].push(final("still here"))
+    await sink.wait_for(is_a(TurnCompleted))
+
+
 async def test_stt_error_when_reopen_fails_ends_in_error_state(harness: Harness) -> None:
     stt = ControlledSTT()
     engine, sink = harness.build(stt=stt)
