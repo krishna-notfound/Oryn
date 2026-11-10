@@ -2,10 +2,11 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AudioScheduler } from "@/lib/audio/AudioScheduler";
-import { BargeInDetector } from "@/lib/audio/BargeInDetector";
+import { InterruptionController } from "@/lib/audio/InterruptionController";
 import { MicCapture } from "@/lib/audio/MicCapture";
 import { VoiceActivityDetector } from "@/lib/audio/VoiceActivityDetector";
 import { perfToEpochMs } from "@/lib/audio/vadCore";
+import { CaptionTrack, runCaptionLoop, type CaptionFrame } from "@/lib/captions/CaptionTrack";
 import { config } from "@/lib/config";
 import type { ServerEvent, ServerTurnMetrics, VoiceState } from "@/lib/realtime/protocol";
 import { CLOSE_PROTOCOL_MISMATCH, RealtimeClient } from "@/lib/realtime/RealtimeClient";
@@ -19,12 +20,16 @@ export interface VoiceSessionState {
   voiceState: VoiceState;
   /** The browser VAD currently hears the user (drives the orb without waiting for the server). */
   userSpeaking: boolean;
+  /** Assistant playback is softened while the server decides whether the user interrupted. */
+  ducked: boolean;
   muted: boolean;
   speakerOn: boolean;
   /** Epoch ms of the first `session.ready`, for the call timer. */
   startedAt: number | null;
   userText: string;
   assistantText: string;
+  /** Voice-synced caption of the reply; null until the first segment is audible. */
+  captions: CaptionFrame | null;
   /** Server marks of the last turn. */
   metrics: ServerTurnMetrics | null;
   /** Client-measured speech end -> first audible sample of the last turn, ms. */
@@ -36,11 +41,13 @@ const INITIAL: VoiceSessionState = {
   status: "idle",
   voiceState: "IDLE",
   userSpeaking: false,
+  ducked: false,
   muted: false,
   speakerOn: true,
   startedAt: null,
   userText: "",
   assistantText: "",
+  captions: null,
   metrics: null,
   perceivedMs: null,
   error: null,
@@ -55,7 +62,9 @@ interface Rig {
   mic: MicCapture;
   scheduler: AudioScheduler;
   vad: VoiceActivityDetector;
-  bargeIn: BargeInDetector;
+  ducking: InterruptionController;
+  captions: CaptionTrack;
+  stopCaptionLoop: () => void;
   voiceState: VoiceState;
   userSpeaking: boolean;
   textGeneration: number | null;
@@ -91,7 +100,8 @@ function describeMicError(error: unknown): string {
 }
 
 /**
- * Wires RealtimeClient + MicCapture + VAD + AudioScheduler + BargeInDetector to React state.
+ * Wires RealtimeClient + MicCapture + VAD + AudioScheduler + InterruptionController + CaptionTrack
+ * to React state.
  * All audio/network objects live in a ref; React only sees the derived UI state.
  */
 export function useVoiceSession({ language }: { language: string }) {
@@ -110,6 +120,7 @@ export function useVoiceSession({ language }: { language: string }) {
     const rig = rigRef.current;
     if (!rig) return;
     rigRef.current = null;
+    rig.stopCaptionLoop();
     rig.vad.close();
     rig.client.end();
     rig.mic.stop();
@@ -128,8 +139,16 @@ export function useVoiceSession({ language }: { language: string }) {
     });
     const scheduler = new AudioScheduler();
     const vad = new VoiceActivityDetector();
-    // Stop locally first so the user hears silence immediately, then tell the server.
-    const bargeIn = new BargeInDetector(scheduler, (generationId) => client.cancelTurn(generationId));
+    const captions = new CaptionTrack();
+    // Overlap: duck at once; a long enough interruption stops locally first, then tells the server.
+    const ducking = new InterruptionController(scheduler, {
+      lastVoicedAt: () => vad.lastVoicedAt,
+      cancelTurn: (generationId) => {
+        captions.freeze(performance.now());
+        client.cancelTurn(generationId);
+      },
+      onDuckedChange: (ducked) => patch({ ducked }),
+    });
     // Mic frames always stream; the VAD only decides what to announce.
     const mic = new MicCapture((frame, level) => {
       client.sendAudio(frame);
@@ -140,7 +159,9 @@ export function useVoiceSession({ language }: { language: string }) {
       mic,
       scheduler,
       vad,
-      bargeIn,
+      ducking,
+      captions,
+      stopCaptionLoop: runCaptionLoop(captions, (frame) => patch({ captions: frame })),
       voiceState: "IDLE",
       userSpeaking: false,
       textGeneration: null,
@@ -161,6 +182,7 @@ export function useVoiceSession({ language }: { language: string }) {
     }
     // teardown() may have run while we awaited permission.
     if (rigRef.current !== rig) {
+      rig.stopCaptionLoop();
       mic.stop();
       scheduler.close();
       return;
@@ -181,6 +203,7 @@ export function useVoiceSession({ language }: { language: string }) {
       return continuing;
     };
 
+    let previousGeneration: number | null = null;
     const onEvent = (event: ServerEvent) => {
       switch (event.type) {
         case "session.ready":
@@ -205,7 +228,20 @@ export function useVoiceSession({ language }: { language: string }) {
           break; // deltas already carry the text
         case "audio.started":
           rig.audioTurnId = event.turn_id ?? null;
-          scheduler.beginGeneration(event.generation_id, event.sample_rate);
+          previousGeneration = scheduler.generationId;
+          if (scheduler.beginGeneration(event.generation_id, event.sample_rate)) {
+            if (scheduler.generationId !== previousGeneration) ducking.reset();
+            captions.begin(event.generation_id, event.sample_rate);
+          }
+          break;
+        case "audio.segment":
+          captions.onSegment(event.generation_id, event.index, event.text, event.first_seq);
+          break;
+        case "audio.segment_done":
+          captions.onSegmentDone(event.generation_id, event.index, event.samples);
+          break;
+        case "turn.resume":
+          ducking.onResume(); // a backchannel: the reply never stopped, just comes back up
           break;
         case "audio.completed":
           scheduler.markGenerationDone(event.generation_id);
@@ -216,7 +252,11 @@ export function useVoiceSession({ language }: { language: string }) {
           break;
         case "turn.cancelled":
           // Server-side cancel (error, dropped speculative turn): silence whatever was playing.
-          if (event.generation_id === undefined || scheduler.generationId === event.generation_id) scheduler.stop();
+          ducking.onCancelled();
+          if (event.generation_id === undefined || scheduler.generationId === event.generation_id) {
+            scheduler.stop();
+            captions.freeze(performance.now());
+          }
           if (event.heard_text) patch({ assistantText: event.heard_text });
           break;
         case "turn.metrics":
@@ -231,10 +271,16 @@ export function useVoiceSession({ language }: { language: string }) {
     };
 
     client.events.on("event", onEvent);
-    client.events.on("audio", (frame) => scheduler.enqueue(frame.generationId, frame.seq, frame.samples));
+    client.events.on("audio", (frame) => {
+      if (scheduler.enqueue(frame.generationId, frame.seq, frame.samples)) {
+        captions.onAudio(frame.generationId, frame.seq, frame.samples.length);
+      }
+    });
     // New socket (first connect or reconnect): server ids restart, nothing old may survive.
     client.events.on("reset", () => {
       scheduler.reset();
+      ducking.reset();
+      captions.reset();
       rig.textGeneration = null;
       rig.audioTurnId = null;
       rig.speechEndAt = null;
@@ -246,7 +292,7 @@ export function useVoiceSession({ language }: { language: string }) {
     client.events.on("closed", ({ code, byUser }) => {
       if (byUser) return;
       teardown();
-      setState((s) => ({ ...s, status: "error", voiceState: "IDLE", userSpeaking: false, error: closeMessage(code) }));
+      setState((s) => ({ ...s, status: "error", voiceState: "IDLE", userSpeaking: false, ducked: false, error: closeMessage(code) }));
     });
 
     scheduler.events.on("scheduled", ({ generationId, audibleAtMs, leadMs }) => {
@@ -257,20 +303,27 @@ export function useVoiceSession({ language }: { language: string }) {
       patch({ perceivedMs: Math.round(perceivedMs) });
       if (rig.audioTurnId !== null) client.turnMetrics(rig.audioTurnId, generationId, perceivedMs, leadMs);
     });
+    scheduler.events.on("chunk", ({ generationId, seq, audibleAtMs }) => captions.onChunkScheduled(generationId, seq, audibleAtMs));
     scheduler.events.on("audible", (id) => client.playbackStarted(id));
-    scheduler.events.on("finished", (id) => client.playbackFinished(id));
+    scheduler.events.on("finished", (id) => {
+      ducking.reset();
+      client.playbackFinished(id);
+    });
 
-    vad.events.on("speechStarted", ({ at }) => {
+    vad.events.on("speechStarted", ({ at, onsetAt }) => {
       rig.speechEndAt = null; // the user resumed: the earlier end is not the one being answered
-      bargeIn.onSpeechStarted(at); // local stop, then turn.cancel; both go out before the speech edge
+      ducking.onSpeechStarted(at, onsetAt); // duck locally before the speech edge goes out
       client.speechStarted(Date.now());
       setUserSpeaking(true);
     });
-    vad.events.on("speechEnded", ({ lastVoicedAt, misfire }) => {
+    vad.events.on("speechEnded", ({ lastVoicedAt, misfire, speechMs }) => {
       // The user stopped at lastVoicedAt, not when the 250 ms hangover elapsed: both the wire
       // timestamp and the perceived-latency origin use the true end.
       client.speechEnded(perfToEpochMs(lastVoicedAt, performance.now(), Date.now()));
       setUserSpeaking(false);
+      // A blip too short to be speech (cough, echo) is not worth a 1.5 s wait at low volume.
+      if (misfire) ducking.onResume();
+      else ducking.onSpeechEnded(speechMs);
       if (!misfire) rig.speechEndAt = lastVoicedAt;
     });
 
@@ -279,7 +332,7 @@ export function useVoiceSession({ language }: { language: string }) {
 
   const end = useCallback(() => {
     teardown();
-    setState((s) => ({ ...s, status: "ended", voiceState: "IDLE", userSpeaking: false, muted: false }));
+    setState((s) => ({ ...s, status: "ended", voiceState: "IDLE", userSpeaking: false, ducked: false, muted: false }));
   }, [teardown]);
 
   const toggleMute = useCallback(() => {

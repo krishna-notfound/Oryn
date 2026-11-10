@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
 import { beforeEach, describe, it } from "node:test";
 import { AudioScheduler } from "../lib/audio/AudioScheduler";
-import { BargeInDetector } from "../lib/audio/BargeInDetector";
-import { AdaptiveLead, audibleAtMs, planChunk, SeqReorderBuffer } from "../lib/audio/schedulerCore";
+import { AdaptiveLead, audibleAtMs, DUCK_GAIN, gainFor, planChunk, RESTORE_RAMP_MS, SeqReorderBuffer } from "../lib/audio/schedulerCore";
 
 // ---------------------------------------------------------------- pure logic
 
@@ -115,6 +114,25 @@ class FakeBuffer {
   }
 }
 
+/** AudioParam that records automation so tests can assert how the gain was changed. */
+class FakeParam {
+  value: number;
+  readonly calls: string[] = [];
+  constructor(initial: number) {
+    this.value = initial;
+  }
+  cancelScheduledValues(at: number) {
+    this.calls.push(`cancel@${at}`);
+  }
+  setValueAtTime(value: number, at: number) {
+    this.calls.push(`set:${value}@${at}`);
+    this.value = value;
+  }
+  linearRampToValueAtTime(value: number, at: number) {
+    this.calls.push(`ramp:${value}@${at}`);
+  }
+}
+
 class FakeContext {
   static last: FakeContext;
   currentTime = 0;
@@ -138,8 +156,9 @@ class FakeContext {
     this.sources.push(source);
     return source;
   }
+  readonly gainParam = new FakeParam(1);
   createGain() {
-    return { gain: { value: 1 }, connect: (node: unknown) => node };
+    return { gain: this.gainParam, connect: (node: unknown) => node };
   }
   createAnalyser() {
     return { fftSize: 1024, connect: (node: unknown) => node, getFloatTimeDomainData() {} };
@@ -325,42 +344,103 @@ describe("AudioScheduler", () => {
   });
 });
 
-describe("barge-in", () => {
-  it("stops local playback FIRST, then sends turn.cancel with the generation id", async () => {
-    const { scheduler, ctx } = await makeScheduler();
-    const log: string[] = [];
-    const bargeIn = new BargeInDetector(scheduler, (generationId) => {
-      // At this point the speaker must already be silent and the buffers gone.
-      log.push(`cancel:${generationId}:active=${scheduler.isActive}:silenced=${ctx.sources.every((s) => s.stopped)}`);
-    });
-    scheduler.beginGeneration(4, RATE);
-    scheduler.enqueue(4, 0, chunk(1));
-    scheduler.enqueue(4, 1, chunk(2));
-    assert.equal(bargeIn.onSpeechStarted(performance.now()), true);
-    assert.deepEqual(log, ["cancel:4:active=false:silenced=true"]);
-    assert.ok(bargeIn.lastStopMs !== null && bargeIn.lastStopMs < 50);
-    assert.equal(scheduler.enqueue(4, 2, chunk(3)), false, "audio that arrives after the barge-in is dropped");
+describe("gainFor", () => {
+  it("mute wins over duck; duck is 20 %", () => {
+    assert.equal(gainFor(false, false), 1);
+    assert.equal(gainFor(false, true), DUCK_GAIN);
+    assert.equal(DUCK_GAIN, 0.2);
+    assert.equal(gainFor(true, true), 0);
+    assert.equal(gainFor(true, false), 0);
+  });
+});
+
+describe("AudioScheduler ducking", () => {
+  let scheduler: AudioScheduler;
+  let ctx: FakeContext;
+
+  beforeEach(async () => {
+    ({ scheduler, ctx } = await makeScheduler());
   });
 
-  it("does nothing when the assistant is not playing", async () => {
-    const { scheduler } = await makeScheduler();
-    const cancels: number[] = [];
-    const bargeIn = new BargeInDetector(scheduler, (id) => cancels.push(id));
-    assert.equal(bargeIn.onSpeechStarted(performance.now()), false);
+  it("duck() steps the gain to 20 % at the current audio time, without stopping anything", () => {
     scheduler.beginGeneration(1, RATE);
-    scheduler.markGenerationDone(1);
-    assert.equal(bargeIn.onSpeechStarted(performance.now()), false);
-    assert.deepEqual(cancels, []);
+    scheduler.enqueue(1, 0, chunk(1));
+    ctx.currentTime = 0.5;
+    ctx.gainParam.calls.length = 0;
+    assert.equal(scheduler.duck(), true);
+    assert.equal(scheduler.isDucked, true);
+    assert.equal(ctx.gainParam.value, DUCK_GAIN);
+    assert.deepEqual(ctx.gainParam.calls, ["cancel@0.5", "set:0.2@0.5"], "one immediate step, no ramp");
+    assert.ok(ctx.sources.every((source) => !source.stopped));
+    assert.equal(scheduler.isActive, true);
   });
 
-  it("a second speech start does not cancel the same generation twice", async () => {
-    const { scheduler } = await makeScheduler();
-    const cancels: number[] = [];
-    const bargeIn = new BargeInDetector(scheduler, (id) => cancels.push(id));
+  it("does nothing when no assistant audio is playing", () => {
+    assert.equal(scheduler.duck(), false);
+    assert.equal(scheduler.isDucked, false);
+    assert.equal(ctx.gainParam.value, 1);
+  });
+
+  it("restore() ramps back to full volume over 150 ms", () => {
+    scheduler.beginGeneration(1, RATE);
+    scheduler.enqueue(1, 0, chunk(1));
+    scheduler.duck();
+    ctx.currentTime = 2;
+    ctx.gainParam.calls.length = 0;
+    scheduler.restore();
+    assert.equal(scheduler.isDucked, false);
+    assert.equal(RESTORE_RAMP_MS, 150);
+    assert.deepEqual(ctx.gainParam.calls, ["cancel@2", "set:0.2@2", "ramp:1@2.15"]);
+  });
+
+  it("stays silent while the speaker is muted, even when ducking and restoring", () => {
+    scheduler.beginGeneration(1, RATE);
+    scheduler.enqueue(1, 0, chunk(1));
+    scheduler.setMuted(true);
+    scheduler.duck();
+    assert.equal(ctx.gainParam.value, 0);
+    scheduler.restore(0);
+    assert.equal(ctx.gainParam.value, 0);
+    scheduler.setMuted(false);
+    assert.equal(ctx.gainParam.value, 1);
+  });
+
+  it("stop() and a new generation start at full volume again", () => {
+    scheduler.beginGeneration(1, RATE);
+    scheduler.enqueue(1, 0, chunk(1));
+    scheduler.duck();
+    scheduler.stop();
+    assert.equal(scheduler.isDucked, false);
+    assert.equal(ctx.gainParam.value, 1);
+
     scheduler.beginGeneration(2, RATE);
-    scheduler.enqueue(2, 0, chunk(1));
-    bargeIn.onSpeechStarted(0);
-    bargeIn.onSpeechStarted(0);
-    assert.deepEqual(cancels, [2]);
+    scheduler.enqueue(2, 0, chunk(2));
+    scheduler.duck();
+    scheduler.beginGeneration(3, RATE);
+    assert.equal(ctx.gainParam.value, 1, "a newer generation replaces the ducked one");
+  });
+
+  it("a generation that finished while ducked releases the duck", () => {
+    scheduler.beginGeneration(1, RATE);
+    scheduler.enqueue(1, 0, chunk(1));
+    scheduler.duck();
+    scheduler.markGenerationDone(1);
+    ctx.sources[0].onended?.();
+    assert.equal(scheduler.isDucked, false);
+    assert.equal(ctx.gainParam.value, 1);
+  });
+});
+
+describe("AudioScheduler chunk timing events", () => {
+  it("reports every chunk's seq, audible time and duration as it is scheduled", async () => {
+    const { scheduler } = await makeScheduler();
+    const chunks: { seq: number; audibleAtMs: number; durationMs: number }[] = [];
+    scheduler.events.on("chunk", (event) => chunks.push(event));
+    scheduler.beginGeneration(1, RATE);
+    scheduler.enqueue(1, 0, chunk(1));
+    scheduler.enqueue(1, 1, chunk(2));
+    assert.deepEqual(chunks.map((c) => c.seq), [0, 1]);
+    assert.ok(chunks.every((c) => Math.abs(c.durationMs - 100) < 1e-6));
+    assert.ok(Math.abs(chunks[1].audibleAtMs - chunks[0].audibleAtMs - 100) < 5, "back to back");
   });
 });

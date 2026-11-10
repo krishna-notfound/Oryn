@@ -1,6 +1,6 @@
 import { GenerationGate } from "../realtime/GenerationGate";
 import { TypedEmitter } from "../realtime/TypedEmitter";
-import { AdaptiveLead, audibleAtMs, int16ToFloat32, planChunk, SeqReorderBuffer } from "./schedulerCore";
+import { AdaptiveLead, audibleAtMs, gainFor, int16ToFloat32, planChunk, RESTORE_RAMP_MS, SeqReorderBuffer } from "./schedulerCore";
 
 export interface ChunkScheduled {
   generationId: number;
@@ -10,9 +10,19 @@ export interface ChunkScheduled {
   leadMs: number;
 }
 
+export interface ChunkTiming {
+  generationId: number;
+  seq: number;
+  /** `performance.now()` time the chunk's first sample is expected to be audible. */
+  audibleAtMs: number;
+  durationMs: number;
+}
+
 export interface SchedulerEvents {
   /** First chunk of a generation was put on the audio clock. */
   scheduled: ChunkScheduled;
+  /** Every chunk put on the audio clock, with where it will be audible (drives synced captions). */
+  chunk: ChunkTiming;
   /** First sample of the generation is (estimated to be) audible now. */
   audible: number;
   /** Generation fully played: completed by the server and every chunk ended. */
@@ -26,6 +36,11 @@ const HORIZON_S = 1.5;
 /** Hard ceiling on PCM waiting to be scheduled (~87 s at 24 kHz); beyond it chunks are dropped. */
 const MAX_PENDING_BYTES = 4 * 1024 * 1024;
 const LEVEL_GAIN = 3;
+
+interface Chunk {
+  seq: number;
+  samples: Int16Array;
+}
 
 interface Graph {
   context: AudioContext;
@@ -48,9 +63,9 @@ export class AudioScheduler {
   private graph: Graph | null = null;
   private readonly gate = new GenerationGate();
   private readonly lead = new AdaptiveLead();
-  private readonly reorder = new SeqReorderBuffer<Int16Array>();
+  private readonly reorder = new SeqReorderBuffer<Chunk>();
   private readonly sources = new Set<AudioBufferSourceNode>();
-  private pending: Int16Array[] = [];
+  private pending: Chunk[] = [];
   private pendingBytes = 0;
 
   private sampleRate = DEFAULT_OUTPUT_RATE;
@@ -60,6 +75,7 @@ export class AudioScheduler {
   private scheduledEmitted = false;
   private audibleTimer: ReturnType<typeof setTimeout> | null = null;
   private muted = false;
+  private ducked = false;
 
   /** Generation currently owning the speaker, or null. */
   get generationId(): number | null {
@@ -69,6 +85,11 @@ export class AudioScheduler {
   /** Assistant audio is in flight: from `audio.started` until the generation drained or was stopped. */
   get isActive(): boolean {
     return this.active;
+  }
+
+  /** Playback is softened because the user is talking over it. */
+  get isDucked(): boolean {
+    return this.ducked;
   }
 
   get leadMs(): number {
@@ -135,7 +156,7 @@ export class AudioScheduler {
     const graph = this.graph;
     if (!graph || generationId !== this.gate.current || samples.length === 0) return false;
     if (graph.context.state !== "running") void graph.context.resume().catch(() => undefined);
-    for (const chunk of this.reorder.push(seq, samples)) this.hold(chunk);
+    for (const chunk of this.reorder.push(seq, { seq, samples })) this.hold(chunk);
     this.pump();
     return true;
   }
@@ -155,7 +176,24 @@ export class AudioScheduler {
 
   setMuted(muted: boolean): void {
     this.muted = muted;
-    if (this.graph) this.graph.gain.gain.value = muted ? 0 : 1;
+    this.applyGain(0);
+  }
+
+  /**
+   * Overlapping user speech: drop to `DUCK_GAIN` at the next render quantum without stopping, so a
+   * "hmm" does not cut the assistant off. Returns false when nothing is playing.
+   */
+  duck(): boolean {
+    if (!this.active) return false;
+    this.ducked = true;
+    this.applyGain(0);
+    return true;
+  }
+
+  /** Back to full volume, ramped so the return is not a jump. */
+  restore(rampMs: number = RESTORE_RAMP_MS): void {
+    this.ducked = false;
+    this.applyGain(rampMs);
   }
 
   /** Output RMS level in 0..1, measured before the mute gain so the orb still moves. */
@@ -185,15 +223,30 @@ export class AudioScheduler {
     const analyser = context.createAnalyser();
     analyser.fftSize = 1024;
     const gain = context.createGain();
-    gain.gain.value = this.muted ? 0 : 1;
+    gain.gain.value = gainFor(this.muted, this.ducked);
     analyser.connect(gain).connect(context.destination);
     return { context, analyser, gain, levelBuffer: new Float32Array(analyser.fftSize) };
   }
 
-  private hold(chunk: Int16Array): void {
-    if (this.pendingBytes + chunk.byteLength > MAX_PENDING_BYTES) return;
+  private applyGain(rampMs: number): void {
+    const graph = this.graph;
+    if (!graph) return;
+    const param = graph.gain.gain;
+    const now = graph.context.currentTime;
+    const target = gainFor(this.muted, this.ducked);
+    param.cancelScheduledValues(now);
+    if (rampMs > 0) {
+      param.setValueAtTime(param.value, now);
+      param.linearRampToValueAtTime(target, now + rampMs / 1000);
+    } else {
+      param.setValueAtTime(target, now);
+    }
+  }
+
+  private hold(chunk: Chunk): void {
+    if (this.pendingBytes + chunk.samples.byteLength > MAX_PENDING_BYTES) return;
     this.pending.push(chunk);
-    this.pendingBytes += chunk.byteLength;
+    this.pendingBytes += chunk.samples.byteLength;
   }
 
   /** Turns waiting PCM into sources while the scheduled audio is shorter than the horizon. */
@@ -202,13 +255,13 @@ export class AudioScheduler {
     if (!graph) return;
     while (this.pending.length > 0) {
       if (this.nextStart !== null && this.nextStart - graph.context.currentTime >= HORIZON_S) break;
-      const chunk = this.pending.shift() as Int16Array;
-      this.pendingBytes -= chunk.byteLength;
+      const chunk = this.pending.shift() as Chunk;
+      this.pendingBytes -= chunk.samples.byteLength;
       this.schedule(graph, chunk);
     }
   }
 
-  private schedule(graph: Graph, samples: Int16Array): void {
+  private schedule(graph: Graph, { seq, samples }: Chunk): void {
     const generationId = this.gate.current;
     if (generationId === null) return;
     const { context, analyser } = graph;
@@ -233,10 +286,12 @@ export class AudioScheduler {
     this.sources.add(source);
     source.start(plan.startAt);
 
-    if (this.scheduledEmitted) return;
-    this.scheduledEmitted = true;
     const latencyS = context.outputLatency || context.baseLatency || 0;
     const audibleAt = audibleAtMs(performance.now(), now, plan.startAt, latencyS);
+    this.events.emit("chunk", { generationId, seq, audibleAtMs: audibleAt, durationMs: buffer.duration * 1000 });
+
+    if (this.scheduledEmitted) return;
+    this.scheduledEmitted = true;
     this.events.emit("scheduled", { generationId, audibleAtMs: audibleAt, leadMs: (plan.startAt - now) * 1000 });
     this.audibleTimer = setTimeout(
       () => {
@@ -254,6 +309,7 @@ export class AudioScheduler {
     this.active = false;
     this.done = false;
     this.scheduledEmitted = false;
+    this.clearDuck();
     if (played) this.events.emit("finished", id);
   }
 
@@ -278,5 +334,13 @@ export class AudioScheduler {
     this.active = false;
     this.done = false;
     this.scheduledEmitted = false;
+    this.clearDuck();
+  }
+
+  /** Nothing left to be loud: the next generation must start at full volume. */
+  private clearDuck(): void {
+    if (!this.ducked) return;
+    this.ducked = false;
+    this.applyGain(0);
   }
 }

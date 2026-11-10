@@ -127,3 +127,31 @@ describe("admitEvent", () => {
     assert.equal(gate.current, 4);
   });
 });
+
+describe("human-conversation events", () => {
+  it("accepts audio.segment / audio.segment_done with their payloads and requires a generation id", () => {
+    const segment = parse({ type: "audio.segment", generation_id: 3, index: 1, text: "Namaste", first_seq: 4 });
+    assert.equal(segment.type, "audio.segment");
+    assert.equal((segment as { first_seq: number }).first_seq, 4);
+    const done = parse({ type: "audio.segment_done", generation_id: 3, index: 1, samples: 48000 });
+    assert.equal((done as { samples: number }).samples, 48000);
+    assert.equal(parseServerEvent(json({ type: "audio.segment", index: 0, text: "x", first_seq: 0 })), null);
+    assert.equal(parseServerEvent(json({ type: "audio.segment_done", index: 0, samples: 1 })), null);
+  });
+
+  it("accepts turn.resume with or without a generation id", () => {
+    assert.ok(parseServerEvent(json({ type: "turn.resume" })));
+    assert.ok(parseServerEvent(json({ type: "turn.resume", generation_id: 5 })));
+    assert.equal(parseServerEvent(json({ type: "turn.resume", generation_id: "5" })), null);
+  });
+
+  it("gates segment and resume events like other generation events", () => {
+    const gate = new GenerationGate();
+    gate.admit(5);
+    gate.retire(5);
+    assert.equal(admitEvent(gate, parse({ type: "audio.segment", generation_id: 5, index: 0, text: "x", first_seq: 0 })), false);
+    assert.equal(admitEvent(gate, parse({ type: "turn.resume", generation_id: 5 })), false, "resume for a stopped reply is moot");
+    assert.equal(admitEvent(gate, parse({ type: "turn.resume" })), true, "an unscoped resume is delivered");
+    assert.equal(admitEvent(gate, parse({ type: "audio.segment_done", generation_id: 6, index: 0, samples: 10 })), true);
+  });
+});

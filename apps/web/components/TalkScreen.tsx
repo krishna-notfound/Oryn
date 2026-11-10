@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Brain, MessageCircle, Mic, MicOff, PhoneOff, Settings, Volume2, VolumeX } from "lucide-react";
 import { useVoiceSession, type CallStatus } from "@/hooks/useVoiceSession";
+import type { CaptionFrame } from "@/lib/captions/CaptionTrack";
 import type { ServerTurnMetrics, VoiceState } from "@/lib/realtime/protocol";
 import { Orb, toOrbState } from "./Orb";
 import { IconLink, TopBar } from "./ui";
@@ -42,8 +43,9 @@ function CallTimer({ startedAt }: { startedAt: number | null }) {
 }
 
 /**
- * Discreet latency readout for the last turn: what the user actually waited (speech end to
- * first audible sound, measured in the browser). Server stage timings sit in the tooltip.
+ * Latency readout for the last turn: what the user actually waited (speech end to first audible
+ * sound, measured in the browser). Server stage timings sit in the tooltip. Debug builds only
+ * (`/talk?debug=1`): a number on the call screen does not make the conversation feel human.
  */
 function LatencyPill({ perceivedMs, metrics }: { perceivedMs: number | null; metrics: ServerTurnMetrics | null }) {
   const shown = perceivedMs ?? metrics?.server_first_audio_ms ?? null;
@@ -90,12 +92,13 @@ function CallButton({
   );
 }
 
-export function TalkScreen({ name, language }: { name: string | null; language: string }) {
+export function TalkScreen({ name, language, debug = false }: { name: string | null; language: string; debug?: boolean }) {
   const session = useVoiceSession({ language });
   const inCall = session.status === "connecting" || session.status === "live";
   // The browser VAD hears the user before the server state catches up: show "listening" at once.
+  // A ducked reply (user talking over it, verdict pending) looks the same: Oryn is listening.
   const orbState =
-    session.userSpeaking && session.voiceState !== "RECONNECTING" && session.voiceState !== "ERROR"
+    (session.userSpeaking || session.ducked) && session.voiceState !== "RECONNECTING" && session.voiceState !== "ERROR"
       ? "listening"
       : toOrbState(session.voiceState, session.status === "live");
 
@@ -106,7 +109,7 @@ export function TalkScreen({ name, language }: { name: string | null; language: 
           title="Live Voice Call"
           right={
             <>
-              <LatencyPill perceivedMs={session.perceivedMs} metrics={session.metrics} />
+              {debug && <LatencyPill perceivedMs={session.perceivedMs} metrics={session.metrics} />}
               <span className="type-label-sm ml-1 inline-flex items-center gap-1 rounded-full bg-secondary-container/40 px-2.5 py-1 text-on-secondary-container">
                 <span className="size-1.5 animate-pulse rounded-full bg-secondary" />
                 <CallTimer startedAt={session.startedAt} />
@@ -232,7 +235,7 @@ function CallView({
   const label =
     session.status === "connecting"
       ? "Connecting…"
-      : session.userSpeaking && session.voiceState !== "RECONNECTING"
+      : (session.userSpeaking || session.ducked) && session.voiceState !== "RECONNECTING"
         ? STATUS_LABEL.LISTENING
         : STATUS_LABEL[session.voiceState];
   return (
@@ -248,15 +251,37 @@ function CallView({
         {label}
       </div>
 
-      <div className="min-h-24 w-full max-w-sm space-y-space-xs text-center">
+      <div className="min-h-32 w-full max-w-sm space-y-space-sm text-center">
         {session.userText && (
           <p className="type-body-md line-clamp-2 text-on-surface-variant">“{session.userText}”</p>
         )}
-        {session.assistantText && (
-          <p className="type-body-lg line-clamp-3 text-on-surface">{session.assistantText}</p>
+        {session.captions ? (
+          <Captions frame={session.captions} />
+        ) : (
+          // Server without caption events: fall back to the plain reply text.
+          session.assistantText && <p className="type-body-lg line-clamp-3 text-on-surface">{session.assistantText}</p>
         )}
         {session.error && <p className="type-body-sm text-error">{session.error}</p>}
       </div>
+    </div>
+  );
+}
+
+/**
+ * The reply as it is spoken: the current segment large with unspoken words dimmed (so the layout
+ * never reflows), the previous segment small and faded above it.
+ */
+function Captions({ frame }: { frame: CaptionFrame }) {
+  return (
+    <div aria-live="off" className="flex flex-col items-center gap-space-xs">
+      {frame.previous && <p className="type-body-sm line-clamp-2 text-on-surface-variant/50 transition-opacity">{frame.previous}</p>}
+      <p className="type-body-lg text-on-surface">
+        {frame.words.map((word, i) => (
+          <span key={i} className={`transition-opacity duration-200 ${i < frame.revealed ? "opacity-100" : "opacity-25"}`}>
+            {word}{" "}
+          </span>
+        ))}
+      </p>
     </div>
   );
 }

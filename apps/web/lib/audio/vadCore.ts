@@ -101,6 +101,11 @@ export class VadCore {
     return this.speaking;
   }
 
+  /** Time of the latest frame that carried voice in the open utterance (0 before any). */
+  get lastVoicedAt(): number {
+    return this.lastVoiceAt;
+  }
+
   get noiseFloor(): number {
     return this.floor;
   }
