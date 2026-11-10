@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
 import { UserRound } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
@@ -98,6 +99,10 @@ export function WelcomeScreen({ authError, needsUsername }: { authError: boolean
             {message}
           </p>
         )}
+
+        <Link href="/privacy" className="type-label-sm text-outline underline-offset-4 hover:underline">
+          Privacy Policy
+        </Link>
       </footer>
     </main>
   );
