@@ -84,6 +84,12 @@ export type LlmStarted = Envelope & Scoped & { type: "llm.started" };
 export type TextDelta = Envelope & Scoped & { type: "text.delta"; delta: string };
 export type TextSegment = Envelope & Scoped & { type: "text.segment"; index: number; text: string };
 export type AudioStarted = Envelope & Scoped & { type: "audio.started"; sample_rate: number; encoding: "pcm_s16le" };
+/** Sent before the first audio chunk of a speakable segment: chunks with seq >= first_seq belong to it. */
+export type AudioSegment = Envelope & Scoped & { type: "audio.segment"; index: number; text: string; first_seq: number };
+/** All audio of segment `index` has been sent; `samples` is its exact length. */
+export type AudioSegmentDone = Envelope & Scoped & { type: "audio.segment_done"; index: number; samples: number };
+/** The overlapping speech was only a backchannel ("haan", "hmm"): the reply carries on. */
+export type TurnResume = Envelope & { type: "turn.resume" };
 export type AudioCompleted = Envelope & Scoped & { type: "audio.completed" };
 export type TurnCompleted = Envelope & Scoped & { type: "turn.completed"; text: string };
 export type TurnCancelled = Envelope & { type: "turn.cancelled"; reason: string; heard_text?: string | null };
@@ -99,6 +105,9 @@ export type ServerEvent =
   | TextDelta
   | TextSegment
   | AudioStarted
+  | AudioSegment
+  | AudioSegmentDone
+  | TurnResume
   | AudioCompleted
   | TurnCompleted
   | TurnCancelled
@@ -107,17 +116,20 @@ export type ServerEvent =
   | Heartbeat;
 
 /**
- * Events tied to one assistant generation. The first six always carry `generation_id`;
- * `turn.cancelled` / `turn.metrics` may not (e.g. a turn that failed before generating) and are
- * then delivered ungated.
+ * Events tied to one assistant generation. The `GENERATION_REQUIRED_TYPES` always carry
+ * `generation_id`; `turn.cancelled` / `turn.metrics` / `turn.resume` may not (e.g. a turn that
+ * failed before generating) and are then delivered ungated.
  */
 export type GenerationEvent =
   | LlmStarted
   | TextDelta
   | TextSegment
   | AudioStarted
+  | AudioSegment
+  | AudioSegmentDone
   | AudioCompleted
   | TurnCompleted
+  | TurnResume
   | TurnCancelled
   | TurnMetricsEvent;
 
@@ -126,6 +138,8 @@ const GENERATION_REQUIRED_TYPES: ReadonlySet<string> = new Set<GenerationEvent["
   "text.delta",
   "text.segment",
   "audio.started",
+  "audio.segment",
+  "audio.segment_done",
   "audio.completed",
   "turn.completed",
 ]);
@@ -133,6 +147,7 @@ const GENERATION_EVENT_TYPES: ReadonlySet<string> = new Set<GenerationEvent["typ
   ...GENERATION_REQUIRED_TYPES,
   "turn.cancelled",
   "turn.metrics",
+  "turn.resume",
 ] as GenerationEvent["type"][]);
 
 const SERVER_EVENT_TYPES: ReadonlySet<string> = new Set<ServerEvent["type"]>([

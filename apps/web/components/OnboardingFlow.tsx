@@ -11,6 +11,7 @@ import {
   STYLES,
   type ProfileInput,
 } from "@/lib/profile";
+import { AUTO_LABEL, AUTO_LANGUAGE } from "@/lib/voices";
 import { Chip, Segmented, Toggle } from "./ui";
 
 type StepId = "name" | "languages" | "interests" | "style" | "preferences" | "memory";
@@ -222,6 +223,18 @@ export function OnboardingFlow({
           {id === "languages" && (
             <div className="flex flex-col gap-space-md">
               <div role="radiogroup" aria-label="Primary language" className="grid grid-cols-2 gap-space-sm">
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={draft.primary_language === AUTO_LANGUAGE}
+                  onClick={() => update({ primary_language: AUTO_LANGUAGE })}
+                  className={`col-span-2 flex min-h-16 flex-col items-start justify-center rounded-2xl px-4 text-left shadow-sm transition-all active:scale-[0.98] ${
+                    draft.primary_language === AUTO_LANGUAGE ? "bg-primary-fixed/30 ring-2 ring-primary-container" : "bg-surface-container-lowest"
+                  }`}
+                >
+                  <span className="type-label-lg text-on-surface">{AUTO_LABEL}</span>
+                  <span className="type-body-sm text-on-surface-variant">Follow whichever language I speak</span>
+                </button>
                 {LANGUAGES.map((language) => {
                   const selected = draft.primary_language === language.code;
                   return (
@@ -247,6 +260,7 @@ export function OnboardingFlow({
                 })}
               </div>
 
+              {draft.primary_language !== AUTO_LANGUAGE && (
               <div>
                 <p className="type-label-md mb-space-sm text-on-surface-variant">Also comfortable in</p>
                 <div className="flex flex-wrap gap-space-sm">
@@ -270,6 +284,7 @@ export function OnboardingFlow({
                   })}
                 </div>
               </div>
+              )}
 
               <div className="flex items-center justify-between gap-space-md rounded-2xl bg-surface-container-low p-space-md">
                 <div>

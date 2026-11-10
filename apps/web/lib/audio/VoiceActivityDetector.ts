@@ -23,6 +23,11 @@ export class VoiceActivityDetector {
     return this.core.isSpeaking;
   }
 
+  /** `performance.now()` of the latest voiced frame of the open utterance. */
+  get lastVoicedAt(): number {
+    return this.core.lastVoicedAt;
+  }
+
   process(level: number, assistantPlaying: boolean): void {
     this.emit(this.core.push(level, performance.now(), assistantPlaying));
   }

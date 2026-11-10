@@ -93,6 +93,17 @@ export function audibleAtMs(nowPerfMs: number, nowCtxS: number, startAtS: number
   return nowPerfMs + (startAtS - nowCtxS + outputLatencyS) * 1000;
 }
 
+/** Playback gain while the user talks over the assistant (spec: duck to 20 %). */
+export const DUCK_GAIN = 0.2;
+/** How long the gain takes to come back after a backchannel (`turn.resume`) or a missing verdict. */
+export const RESTORE_RAMP_MS = 150;
+
+/** Output gain for the current mute/duck state; mute always wins. */
+export function gainFor(muted: boolean, ducked: boolean): number {
+  if (muted) return 0;
+  return ducked ? DUCK_GAIN : 1;
+}
+
 export function int16ToFloat32(samples: Int16Array, out: Float32Array): void {
   for (let i = 0; i < samples.length; i++) out[i] = samples[i] / 32768;
 }

@@ -4,9 +4,12 @@ import { useState, type ReactNode } from "react";
 import Link from "next/link";
 import { Brain, ChevronRight, Languages, Pencil, ShieldCheck, Smile, Mic2 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
-import { INTERESTS, LANGUAGES, STYLES, languageLabel, type Profile } from "@/lib/profile";
+import { useVoiceCatalog } from "@/hooks/useVoiceCatalog";
+import { INTERESTS, STYLES, type Profile } from "@/lib/profile";
+import { AUTO_LANGUAGE, languageOptions, voiceSummary } from "@/lib/voices";
 import { AccountSection } from "./AccountSection";
 import { Chip, Segmented, Toggle, TopBar } from "./ui";
+import { VoicePicker } from "./VoicePicker";
 
 const CARD = "rounded-xl bg-surface-container-lowest p-space-md shadow-[0_4px_20px_-2px_rgba(31,32,36,0.04)]";
 
@@ -44,7 +47,10 @@ export function SettingsScreen({ initial, email, isGuest }: { initial: Profile; 
   const [profile, setProfile] = useState(initial);
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(initial.preferred_name ?? "");
-  const [voiceDraft, setVoiceDraft] = useState(initial.voice ?? "");
+  const catalog = useVoiceCatalog();
+  const languages = languageOptions(catalog);
+  const languageName = (code: string) => languages.find((entry) => entry.code === code)?.name ?? code;
+  const auto = profile.primary_language === AUTO_LANGUAGE;
   const [notice, setNotice] = useState<string | null>(null);
 
   /** Optimistic save of profile columns; reverts and reports on failure. Consent changes are audited. */
@@ -128,33 +134,41 @@ export function SettingsScreen({ initial, email, isGuest }: { initial: Profile; 
               icon={<Languages size={20} />}
               tint="bg-primary-fixed/50 text-primary"
               label="Language"
-              value={[profile.primary_language, ...profile.extra_languages].map((code) => languageLabel(code).split(" ")[0]).join(", ")}
+              value={(auto ? [AUTO_LANGUAGE] : [profile.primary_language, ...profile.extra_languages]).map(languageName).join(", ")}
             />
           }
         >
           <div className="flex flex-col gap-space-sm">
             <p className="type-label-md text-on-surface-variant">Primary language</p>
             <div role="radiogroup" aria-label="Primary language" className="flex flex-wrap gap-space-sm">
-              {LANGUAGES.map((language) => (
+              {languages.map((language) => (
                 <Chip
                   key={language.code}
                   selected={profile.primary_language === language.code}
                   onClick={() =>
-                    save({
-                      primary_language: language.code,
-                      extra_languages: profile.extra_languages.filter((code) => code !== language.code),
-                    })
+                    save(
+                      language.auto
+                        ? { primary_language: AUTO_LANGUAGE }
+                        : {
+                            primary_language: language.code,
+                            extra_languages: profile.extra_languages.filter((code) => code !== language.code),
+                          },
+                    )
                   }
                 >
                   {language.name}
                 </Chip>
               ))}
             </div>
+            {auto && (
+              <p className="type-body-sm text-on-surface-variant">Oryn will follow whichever language you speak in each sentence.</p>
+            )}
           </div>
+          {!auto && (
           <div className="flex flex-col gap-space-sm">
             <p className="type-label-md text-on-surface-variant">Also comfortable in</p>
             <div className="flex flex-wrap gap-space-sm">
-              {LANGUAGES.filter((language) => language.code !== profile.primary_language).map((language) => {
+              {languages.filter((language) => !language.auto && language.code !== profile.primary_language).map((language) => {
                 const selected = profile.extra_languages.includes(language.code);
                 return (
                   <Chip
@@ -174,6 +188,7 @@ export function SettingsScreen({ initial, email, isGuest }: { initial: Profile; 
               })}
             </div>
           </div>
+          )}
           <div className="flex items-center justify-between gap-space-md">
             <p className="type-body-md text-on-surface">Mix languages mid-sentence</p>
             <Toggle checked={profile.code_switching} onChange={(value) => save({ code_switching: value })} label="Mix languages" />
@@ -181,22 +196,9 @@ export function SettingsScreen({ initial, email, isGuest }: { initial: Profile; 
         </Expandable>
 
         {/* Voice */}
-        <div className={CARD}>
-          <Row icon={<Mic2 size={20} />} tint="bg-secondary-container/50 text-secondary" label="Voice" value={profile.voice || "Default voice"} />
-          <label className="sr-only" htmlFor="voice">Voice id</label>
-          <input
-            id="voice"
-            value={voiceDraft}
-            maxLength={60}
-            onChange={(event) => setVoiceDraft(event.target.value)}
-            onBlur={() => {
-              const voice = voiceDraft.trim() || null;
-              if (voice !== profile.voice) void save({ voice });
-            }}
-            placeholder="Voice id (optional)"
-            className="type-body-md mt-space-sm h-12 w-full rounded-xl border border-outline-variant/40 bg-surface px-4 placeholder:text-outline/70 focus:border-primary-container focus:outline-none focus:ring-4 focus:ring-primary-container/25"
-          />
-        </div>
+        <Expandable row={<Row icon={<Mic2 size={20} />} tint="bg-secondary-container/50 text-secondary" label="Voice" value={voiceSummary(catalog, profile.voice)} />}>
+          <VoicePicker catalog={catalog} selected={profile.voice} onSelect={(voice) => void save({ voice })} />
+        </Expandable>
 
         {/* Communication style */}
         <Expandable row={<Row icon={<Smile size={20} />} tint="bg-surface-container text-on-surface-variant" label="Communication style" value={style?.title ?? profile.style} />}>
