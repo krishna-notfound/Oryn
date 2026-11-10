@@ -220,6 +220,7 @@ class VoiceConversation(Conversation):
         self._awaiting_final = False
         self._cancel_prefix_flush()
         await self._on_user_speech()
+        self._arbiter.hold()  # the contest cannot lapse while they are still talking
 
     async def on_speech_ended(self) -> None:
         if self._link is None:

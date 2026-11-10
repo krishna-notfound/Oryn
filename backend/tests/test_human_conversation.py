@@ -196,11 +196,26 @@ async def test_without_a_transcript_the_contest_lapses_and_the_client_is_told(
 ) -> None:
     engine, _, sink, _ = await start_speaking(harness, settings=settings(contest_timeout_s=0.05))
     await engine.on_speech_started()
+    await engine.on_speech_ended()  # they stopped, and no transcript ever comes
     await sink.wait_for(is_a(TurnResume))
     await sink.wait_for(is_a(TurnCompleted))
 
     assert not sink.of_type(TurnCancelled)
     assert not engine._arbiter.contested
+
+
+async def test_a_long_interruption_is_not_timed_out_while_the_user_is_still_talking(
+    harness: Harness,
+) -> None:
+    engine, stt, sink, _ = await start_speaking(harness, settings=settings(contest_timeout_s=0.05))
+    await engine.on_speech_started()
+    await asyncio.sleep(0.2)  # well past the timeout, but the browser says they are still talking
+    assert not sink.of_type(TurnResume) and engine._arbiter.contested
+
+    await engine.on_speech_ended()
+    stt.streams[0].push(final("hold on, a different question"))
+    await sink.wait_for(is_a(TurnCancelled))
+    assert sink.of_type(TurnCancelled)[0].reason == "user_spoke"
 
 
 async def test_the_contest_ends_with_the_reply(harness: Harness) -> None:

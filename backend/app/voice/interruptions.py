@@ -120,6 +120,11 @@ class InterruptionArbiter:
         self._arm()
         return True
 
+    def hold(self) -> None:
+        """The user is still talking: the contest cannot lapse until `touch` says they stopped."""
+        if self._contested:
+            self._disarm()
+
     def touch(self) -> None:
         """Give the transcript a fresh `timeout_s` (the user just stopped talking)."""
         if self._contested:

@@ -124,6 +124,23 @@ async def test_touch_pushes_the_deadline_back() -> None:
     assert fired == [True]
 
 
+async def test_hold_keeps_the_contest_open_while_the_user_talks() -> None:
+    fired: list[bool] = []
+
+    async def on_expired() -> None:
+        fired.append(True)
+
+    arbiter = InterruptionArbiter(on_expired, timeout_s=0.02)
+    arbiter.contest()
+    arbiter.hold()
+    await asyncio.sleep(0.08)
+    assert arbiter.contested and not fired  # a long interruption is not timed out mid-sentence
+
+    arbiter.touch()  # they stopped; the transcript has timeout_s to arrive
+    await asyncio.sleep(0.08)
+    assert fired == [True] and not arbiter.contested
+
+
 async def test_a_verdict_cancels_the_timeout() -> None:
     fired: list[bool] = []
 
