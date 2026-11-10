@@ -203,7 +203,7 @@ async def test_interrupt_mid_speech_stops_audio_for_the_old_generation(harness: 
     await speak_one_turn(engine)
     await sink.wait_for(is_a(AudioFrame))
 
-    await engine.on_speech_started()
+    await engine.on_cancel(1)
     frames_at_interrupt = len(sink.frames)
     await asyncio.sleep(0.05)
 
@@ -222,6 +222,7 @@ async def test_interrupt_is_idempotent_and_safe_when_idle(harness: Harness) -> N
     await engine.start()
     await engine.on_speech_started()  # nothing in flight
     assert not sink.of_type(TurnCancelled)
+    assert not engine._arbiter.contested
 
     await engine.on_audio(b"\x00" * 640)
     await engine.on_speech_ended()
@@ -239,7 +240,7 @@ async def test_next_turn_after_barge_in_gets_a_new_generation(harness: Harness) 
     )
     await speak_one_turn(engine)
     await sink.wait_for(is_a(AudioFrame))
-    await engine.on_speech_started()
+    await engine.on_cancel(1)
     old_frames = len(sink.frames)
 
     await engine.on_text("tell me more")
@@ -250,19 +251,18 @@ async def test_next_turn_after_barge_in_gets_a_new_generation(harness: Harness) 
     assert sink.of_type(TextDelta)[-1].generation_id == 2
 
 
-async def test_interrupted_reply_is_remembered_as_cut_off(harness: Harness) -> None:
+async def test_reply_cut_off_before_a_word_was_heard_leaves_no_trace(harness: Harness) -> None:
     llm = FakeLanguageModel(LONG_REPLY, delay=0.001)
     engine, sink = harness.build(llm=llm, tts=FakeTextToSpeech(delay=0.03))
     await speak_one_turn(engine)
     await sink.wait_for(is_a(AudioFrame))
-    await engine.on_speech_started()
+    await engine.on_cancel(1)
     await engine.on_text("sorry, go on")
     await sink.wait_for(is_a(TurnCompleted))
 
     history = llm.calls[1][1:]
-    assert [m.role for m in history] == ["user", "assistant", "user"]
-    assert history[1].content.endswith("[interrupted by user]")
-    assert len(history[1].content) < len(LONG_REPLY)  # truncated, not the whole reply
+    assert [(m.role, m.content) for m in history[:-1]] == [("user", TWO_SENTENCES)]
+    assert "cut off" not in llm.calls[1][0].content  # nothing heard, nothing to remind it of
 
 
 async def test_history_keeps_only_sentences_that_finished_playing(
@@ -280,7 +280,8 @@ async def test_history_keeps_only_sentences_that_finished_playing(
     await sink.wait_for_state(S.GENERATING, 2)
 
     assert llm.calls[1][1].role == "user"
-    assert llm.calls[1][2].content == "Alpha beta gamma. [interrupted by user]"
+    assert llm.calls[1][2].content == "Alpha beta gamma."  # heard text only, no marker
+    assert 'cut off while saying: "Alpha beta gamma."' in llm.calls[1][0].content
 
 
 async def test_full_playback_then_late_interrupt_is_not_marked_cut_off(
@@ -298,7 +299,7 @@ async def test_full_playback_then_late_interrupt_is_not_marked_cut_off(
     assert llm.calls[1][2].content == TWO_SENTENCES
 
 
-async def test_server_side_speech_start_during_speaking_triggers_barge_in(
+async def test_server_side_speech_start_during_speaking_only_contests_the_turn(
     harness: Harness,
 ) -> None:
     stt = ControlledSTT()
@@ -312,12 +313,11 @@ async def test_server_side_speech_start_during_speaking_triggers_barge_in(
     await sink.wait_for_state(S.SPEAKING)
 
     stt.streams[0].push(SpeechStarted())
-    await sink.wait_for(is_a(TurnCancelled))
-    await sink.wait_for_state(S.LISTENING, 2)
     frames = len(sink.frames)
-    await asyncio.sleep(0.05)
+    await sink.wait_for(lambda i: isinstance(i, AudioFrame) and i.seq > frames)  # still talking
 
-    assert len(sink.frames) == frames
+    assert not sink.of_type(TurnCancelled)
+    assert engine._arbiter.contested
 
 
 async def test_speech_start_while_listening_is_not_an_interrupt(harness: Harness) -> None:
@@ -610,6 +610,30 @@ async def test_retryable_stt_error_reopens_the_stream_once(harness: Harness) -> 
     await asyncio.sleep(0.01)
     assert stt.streams[1].audio == [b"abc"]
     stt.streams[1].push(final("still works"))
+    await sink.wait_for(is_a(TurnCompleted))
+
+
+async def test_a_long_lived_stream_ending_is_rotated_without_telling_the_user(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The provider caps a session at 15 minutes: that is routine, not an error."""
+    monkeypatch.setattr(stt_link_module, "STABLE_AFTER_S", 0.05)
+    stt = ControlledSTT()
+    engine, sink = harness.build(stt=stt)
+    await engine.start()
+    await asyncio.sleep(0.08)
+    stt.streams[0].push(ProviderError("prisma", "session limit", retryable=True))
+    for _ in range(200):
+        if len(stt.streams) == 2:
+            break
+        await asyncio.sleep(0.005)
+
+    assert len(stt.streams) == 2 and stt.streams[0].closed
+    assert sink.states == [S.LISTENING] and not sink.of_type(PipelineError)
+    await engine.on_audio(b"abc")
+    await asyncio.sleep(0.01)
+    assert stt.streams[1].audio == [b"abc"]
+    stt.streams[1].push(final("still here"))
     await sink.wait_for(is_a(TurnCompleted))
 
 

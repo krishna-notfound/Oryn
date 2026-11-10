@@ -148,13 +148,19 @@ class ScriptedLLM(LanguageModel):
     def __init__(self, rounds: list[list[LLMChunk]]) -> None:
         self._rounds = rounds
         self.calls: list[list[ChatMessage]] = []
+        self.max_tokens: list[int | None] = []
         self.tool_specs: list[Sequence[ToolSpec]] = []
 
     async def stream(
-        self, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec] = ()
+        self,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec] = (),
+        *,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[LLMChunk]:
         self.calls.append(list(messages))
         self.tool_specs.append(tools)
+        self.max_tokens.append(max_tokens)
         for chunk in self._rounds[len(self.calls) - 1]:
             await asyncio.sleep(0)
             yield chunk
@@ -168,7 +174,11 @@ class FailingLLM(LanguageModel):
         self._error = error
 
     async def stream(
-        self, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec] = ()
+        self,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec] = (),
+        *,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[LLMChunk]:
         raise self._error
         yield LLMChunk()  # pragma: no cover - makes this an async generator

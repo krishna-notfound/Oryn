@@ -22,6 +22,11 @@ Start the server first, then (from `backend/`):
 
 The token is a user access token (1 h lifetime); it is read from `--token` or `ORYN_TOKEN`.
 Provider keys come from the usual `.env` (needed only to synthesise the test audio).
+
+`--human` runs the human-conversation check instead (one Hinglish session): ask for a story,
+verify it streams as several captioned segments, nod along mid-story ("haan") and expect
+`turn.resume` with the audio carrying on, then talk over it with a real request and expect
+`turn.cancelled{reason: user_spoke}` and a natural reply that does not mention the interruption.
 """
 
 from __future__ import annotations
@@ -31,10 +36,12 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import statistics
 import struct
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -367,7 +374,202 @@ def print_summary(results: list[TurnResult]) -> None:
     )
 
 
+# ---------------------------------------------------------------- human-conversation check
+
+STORY_REQUEST = "mujhe ek chhoti si kahani sunao"
+BACKCHANNEL = "haan haan"
+INTERRUPTION = "ruko ruko, mujhe kuch aur poochna hai, aaj ka mausam kaisa rehta hai?"
+NODS_AFTER_SEGMENTS = 3  # nod once this many caption segments of the story have arrived
+MENTIONS_INTERRUPTION = re.compile(
+    r"interrupt|cut me off|cut off|beech mein|beech me|toka|rok diya|sorry for", re.IGNORECASE
+)
+
+
+@dataclass
+class Observed:
+    t: float
+    kind: str  # "event" | "audio"
+    body: dict[str, Any]
+
+
+class Recorder:
+    """Everything the server sends, in order, with arrival times; waiters watch the log."""
+
+    def __init__(self, ws: ClientConnection) -> None:
+        self._ws = ws
+        self.log: list[Observed] = []
+        self.changed = asyncio.Condition()
+        self._playing: set[int] = set()
+
+    async def pump(self) -> None:
+        async for message in self._ws:
+            now = time.perf_counter()
+            if isinstance(message, bytes):
+                generation, seq = AUDIO_HEADER.unpack(message[: AUDIO_HEADER.size])
+                body: dict[str, Any] = {
+                    "generation_id": generation,
+                    "seq": seq,
+                    "bytes": len(message) - AUDIO_HEADER.size,
+                }
+                await self._add(Observed(now, "audio", body))
+                if generation not in self._playing:  # the browser reports when audio is audible
+                    self._playing.add(generation)
+                    await self.send({"type": "playback.started", "generation_id": generation})
+            else:
+                await self._add(Observed(now, "event", json.loads(message)))
+
+    async def _add(self, item: Observed) -> None:
+        async with self.changed:
+            self.log.append(item)
+            self.changed.notify_all()
+
+    async def send(self, message: dict[str, Any]) -> None:
+        with contextlib.suppress(Exception):
+            await self._ws.send(json.dumps({"v": 2, **message}))
+
+    async def until(self, condition: Callable[[list[Observed]], bool]) -> None:
+        try:
+            async with asyncio.timeout(TURN_TIMEOUT_S), self.changed:
+                await self.changed.wait_for(lambda: condition(self.log))
+        except TimeoutError:
+            self.dump()
+            raise
+
+    def dump(self, last: int = 25) -> None:
+        """What the server sent most recently, to see why an expectation never came true."""
+        print("  ... timed out; the last events were:")
+        shown = [o for o in self.log if o.kind == "event" and o.body["type"] not in QUIET_EVENTS]
+        for o in shown[-last:]:
+            detail = {k: v for k, v in o.body.items() if k in ("text", "reason", "state", "index")}
+            print(f"    {o.body['type']} {detail}")
+
+    def events(self, kind: str, since: int = 0) -> list[dict[str, Any]]:
+        return [o.body for o in self.log[since:] if o.kind == "event" and o.body["type"] == kind]
+
+    def first_index(self, kind: str, since: int = 0) -> int:
+        return next(
+            i
+            for i, o in enumerate(self.log[since:], since)
+            if o.kind == "event" and o.body["type"] == kind
+        )
+
+    def frames(self, since: int = 0) -> list[dict[str, Any]]:
+        return [o.body for o in self.log[since:] if o.kind == "audio"]
+
+
+async def beat(recorder: Recorder) -> None:
+    """The browser's 15-second heartbeat; without it a quiet session is closed as idle."""
+    while True:
+        await asyncio.sleep(15)
+        await recorder.send({"type": "heartbeat"})
+
+
+def saw(kind: str, since: int, count: int = 1) -> Callable[[list[Observed]], bool]:
+    return lambda log: (
+        sum(o.kind == "event" and o.body["type"] == kind for o in log[since:]) >= count
+    )
+
+
+QUIET_EVENTS = frozenset({"text.delta", "text.segment", "heartbeat"})
+
+
+def check(label: str, ok: bool, detail: str = "") -> bool:
+    print(f"  [{'ok' if ok else 'FAIL'}] {label}" + (f" - {detail}" if detail else ""))
+    return ok
+
+
+async def run_human_check(url: str, token: str, settings: Settings) -> bool:
+    print("synthesising the test utterances ...", flush=True)
+    scenario = Scenario("hinglish", "hi-IN", "hi-en", (STORY_REQUEST, BACKCHANNEL, INTERRUPTION))
+    story_pcm, nod_pcm, interruption_pcm = await synthesise(settings, scenario)
+    ok = True
+    async with connect(url, max_size=None, max_queue=None) as ws:
+        recorder = Recorder(ws)
+        pump = asyncio.create_task(recorder.pump())
+        heartbeat = asyncio.create_task(beat(recorder), name="heartbeat")
+        start = {"v": 2, "type": "session.start", "token": token, "language": "hi-IN"}
+        await ws.send(json.dumps(start))
+        await recorder.until(saw("session.ready", 0))
+        output_rate = recorder.events("session.ready")[0]["output_sample_rate"]
+        speaker = Player(ws)  # stream_utterance only needs its `speech_end_at` slot
+
+        print("\n(a) a story, streamed as captioned segments")
+        story_mark = mark = len(recorder.log)
+        await stream_utterance(ws, speaker, story_pcm)
+        await recorder.until(saw("audio.segment", mark, NODS_AFTER_SEGMENTS))
+        segments = recorder.events("audio.segment", mark)
+        print(f"  story opening: {segments[0]['text']!r}")
+        print(f"  2nd segment  : {segments[1]['text']!r}")
+        first_seqs = [s["first_seq"] for s in segments]
+        ok &= check("segments stream in while the story is still being told", len(segments) >= 3)
+        ok &= check("segments carry increasing first_seq", first_seqs == sorted(set(first_seqs)))
+
+        print("\n(b) a backchannel mid-story")
+        mark = len(recorder.log)
+        await stream_utterance(ws, speaker, nod_pcm)
+        await recorder.until(saw("turn.resume", mark))
+        resumed = recorder.first_index("turn.resume", mark)
+        await recorder.until(lambda log: sum(o.kind == "audio" for o in log[resumed:]) >= 15)
+        heard_as = [e["text"] for e in recorder.events("transcript.final", mark)]
+        print(f"  the nod was heard as: {heard_as!r}")
+        ok &= check("turn.resume arrived", True)
+        ok &= check("the nod was not treated as a turn (no transcript.final)", not heard_as)
+        ok &= check("no turn.cancelled", not recorder.events("turn.cancelled", mark))
+        ok &= check("audio kept coming after the resume", len(recorder.frames(resumed)) >= 15)
+
+        print("\n    ... the rest of the story")
+        await recorder.until(saw("turn.completed", story_mark))
+        story = recorder.events("turn.completed", story_mark)[0]
+        segments = recorder.events("audio.segment", story_mark)
+        done = recorder.events("audio.segment_done", story_mark)
+        sound = [
+            f for f in recorder.frames(story_mark) if f["generation_id"] == story["generation_id"]
+        ]
+        samples = sum(f["bytes"] for f in sound) // 2
+        print(
+            f"  story: {len(story['text'])} chars in {len(segments)} segments, "
+            f"{samples / output_rate:.1f}s of audio"
+        )
+        ok &= check("a long reply: at least 5 captioned segments", len(segments) >= 5)
+        ok &= check(
+            "every segment is closed in order with an exact sample count",
+            [d["index"] for d in done] == [s["index"] for s in segments]
+            and sum(d["samples"] for d in done) == samples,
+        )
+
+        print("\n(c) a real interruption, while the story is still playing")
+        await asyncio.sleep(2.0)  # the browser is a few seconds into playing it
+        mark = len(recorder.log)
+        await stream_utterance(ws, speaker, interruption_pcm)
+        await recorder.until(saw("turn.cancelled", mark))
+        cut = recorder.first_index("turn.cancelled", mark)
+        cancelled = recorder.log[cut].body
+        print(
+            f"  cancelled: reason={cancelled['reason']!r}, heard={cancelled['heard_text'][:80]!r}"
+        )
+        ok &= check("turn.cancelled says user_spoke", cancelled["reason"] == "user_spoke")
+        await recorder.until(saw("turn.completed", cut))
+        stale = [
+            f for f in recorder.frames(cut) if f["generation_id"] == cancelled["generation_id"]
+        ]
+        ok &= check("no audio of the cancelled generation after turn.cancelled", not stale)
+        reply = recorder.events("turn.completed", cut)[0]["text"]
+        said = [e["text"] for e in recorder.events("transcript.final", cut)]
+        print(f"  the interruption was heard as: {said!r}")
+        print(f"  reply: {reply}")
+        ok &= check(
+            "the reply does not mention being interrupted", not MENTIONS_INTERRUPTION.search(reply)
+        )
+        errors = recorder.events("pipeline.error")
+        ok &= check("no pipeline errors", not errors, str(errors))
+        await ws.send(json.dumps({"v": 2, "type": "session.end"}))
+        pump.cancel()
+        heartbeat.cancel()
+    return ok
+
+
 async def main() -> int:
+    sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]  # replies are Indic text
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--url", default="ws://localhost:8000/ws")
     parser.add_argument("--token", default=os.environ.get("ORYN_TOKEN"))
@@ -380,9 +582,13 @@ async def main() -> int:
         help="label only: the server's GNANI_TTS_TRANSPORT this run was made against",
     )
     parser.add_argument("--only", choices=[s.label for s in SCENARIOS], action="append")
+    parser.add_argument("--human", action="store_true", help="run the human-conversation check")
     args = parser.parse_args()
     if not args.token:
         sys.exit("pass --token or set ORYN_TOKEN")
+    if args.human:
+        passed = await run_human_check(args.url, args.token, Settings(_env_file=args.env_file))
+        return 0 if passed else 1
 
     print(f"TTS transport (server setting): {args.transport}")
     settings = Settings(_env_file=args.env_file)

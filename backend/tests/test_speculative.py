@@ -165,7 +165,7 @@ async def test_speech_ended_before_the_transcript_skips_the_grace_period(
     await sink.wait_for(is_a(AudioFrame))  # would time out if the 5 s gate applied
 
 
-async def test_speech_after_confirm_is_barge_in(harness: Harness) -> None:
+async def test_speech_after_confirm_contests_and_words_make_it_a_barge_in(harness: Harness) -> None:
     stt = ControlledSTT()
     llm = FakeLanguageModel(LONG_REPLY, delay=0.001)
     engine, sink = harness.build(
@@ -176,14 +176,14 @@ async def test_speech_after_confirm_is_barge_in(harness: Harness) -> None:
     await sink.wait_for_state(S.SPEAKING)
 
     await engine.on_speech_started()
+    assert not sink.of_type(TurnCancelled)  # heard speech is contested, not cancelled
 
-    (cancelled,) = sink.of_type(TurnCancelled)
-    assert cancelled.reason == "barge_in"
-    assert sink.states[-3:] == [S.SPEAKING, S.INTERRUPTED, S.LISTENING]
     # not merged: the cut-off exchange is history, the next transcript stands alone
     await engine.on_speech_ended()
     stt.streams[0].push(final("sorry go on"))
     await sink.wait_for(lambda i: isinstance(i, TranscriptFinal) and i.turn_id == 2)
+    (cancelled,) = sink.of_type(TurnCancelled)
+    assert cancelled.reason == "user_spoke"
     assert [t.text for t in sink.of_type(TranscriptFinal)] == ["tell me a story", "sorry go on"]
     assert llm.calls[1][1].content == "tell me a story"
 

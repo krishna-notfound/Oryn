@@ -30,6 +30,8 @@ from app.voice.segmenter import SentenceSegmenter
 from app.voice.state import VoiceState
 from app.websocket.protocol import (
     AudioCompleted,
+    AudioSegment,
+    AudioSegmentDone,
     AudioStarted,
     ServerEvent,
     TextDelta,
@@ -136,11 +138,12 @@ class _Segment:
 @dataclass(frozen=True, slots=True)
 class _Audio:
     pcm: bytes
+    segment: _Segment
 
 
 @dataclass(frozen=True, slots=True)
 class _SegmentEnd:
-    text: str
+    segment: _Segment
 
 
 _PcmItem = _Audio | _SegmentEnd | None
@@ -155,7 +158,8 @@ class TurnPipeline:
         language: str,
         voice: str | None,
     ) -> None:
-        """`tts=None` is a text-only turn: the reply is streamed as text and nothing is spoken."""
+        """`tts=None` is a text-only turn: the reply is streamed as text and nothing is spoken.
+        `language` and `voice` are the defaults; a turn that resolved its own wins."""
         self._output = output
         self._tts = tts
         self._language = language
@@ -240,13 +244,17 @@ class TurnPipeline:
     ) -> None:
         while (segment := await segments.get()) is not None:
             turn.timer.mark("tts_request")
-            stream = tts.synthesize(segment.text, language=self._language, voice=self._voice)
+            stream = tts.synthesize(
+                segment.text,
+                language=turn.language or self._language,
+                voice=turn.voice or self._voice,
+            )
             async with closing(stream) as audio:
                 async for chunk in audio:
                     turn.timer.mark("tts_first_byte")
                     if chunk:
-                        await pcm.put(_Audio(chunk), len(chunk))
-            await pcm.put(_SegmentEnd(segment.text))
+                        await pcm.put(_Audio(chunk, segment), len(chunk))
+            await pcm.put(_SegmentEnd(segment))
         await pcm.put(None)
 
     async def _send_audio(
@@ -254,18 +262,31 @@ class TurnPipeline:
     ) -> None:
         bytes_per_second = sample_rate * 2
         seq = 0
+        open_segment: _Segment | None = None  # announced, not yet closed
+        segment_bytes = 0
         while (item := await pcm.get()) is not None:
             match item:
-                case _SegmentEnd(text=text):
-                    turn.sentence_ends.append((text, turn.audio_bytes / bytes_per_second))
-                case _Audio(pcm=chunk):
+                case _SegmentEnd(segment=segment):
+                    turn.sentence_ends.append((segment.text, turn.audio_bytes / bytes_per_second))
+                    if open_segment == segment:  # a segment that made no sound is never announced
+                        done = AudioSegmentDone(index=segment.index, samples=segment_bytes // 2)
+                        await self._output.event(turn, done)
+                        open_segment = None
+                case _Audio(pcm=chunk, segment=segment):
                     if not turn.audio_started:
                         await turn.generating.wait()  # confirmed, and GENERATING went out first
                         turn.audio_started = True
                         await self._output.event(turn, AudioStarted(sample_rate=sample_rate))
                         await self._output.state(turn, VoiceState.SPEAKING)
+                    if open_segment != segment:
+                        open_segment, segment_bytes = segment, 0
+                        announce = AudioSegment(
+                            index=segment.index, text=segment.text, first_seq=seq
+                        )
+                        await self._output.event(turn, announce)
                     await self._output.audio(turn, seq, chunk)
                     seq += 1
+                    segment_bytes += len(chunk)
                     turn.audio_bytes += len(chunk)
                     turn.audio_sent_at = turn.audio_sent_at or perf_counter()
                     turn.timer.mark("first_audio_sent")

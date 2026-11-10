@@ -33,7 +33,8 @@ class Turn:
     user_text: str
     timer: TurnTimer
     speculative: bool  # started on a final transcript; audio is held until confirmed
-    language: str | None = None  # detected language of a spoken input
+    language: str | None = None  # the turn's language: what TTS speaks and the browser is told
+    voice: str | None = None  # Timbre voice for that language
     from_voice: bool = False  # spoken input: the transcript is announced to the browser
     confirmed: asyncio.Event = field(default_factory=asyncio.Event)  # the audio gate
     generating: asyncio.Event = field(default_factory=asyncio.Event)  # GENERATING was announced
@@ -85,6 +86,7 @@ class TurnManager:
         speculative: bool,
         grace_s: float = 0.0,
         language: str | None = None,
+        voice: str | None = None,
         from_voice: bool = False,
     ) -> Turn:
         """Start a turn, replacing any in flight. A speculative turn confirms itself after
@@ -101,6 +103,7 @@ class TurnManager:
                 TurnTimer(),
                 speculative=speculative,
                 language=language,
+                voice=voice,
                 from_voice=from_voice,
             )
             turn.timer.mark("turn_started")

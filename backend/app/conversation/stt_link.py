@@ -26,7 +26,8 @@ from app.providers.base import (
 log = logging.getLogger(__name__)
 
 INGRESS_FRAMES = 100  # ~2 s of 20 ms frames; beyond that the oldest audio is dropped
-STABLE_AFTER_S = 5.0  # a stream that lived this long resets the failure count
+STABLE_AFTER_S = 5.0  # a stream that lived this long resets the failure count and, when it
+# ends, is simply rotated (the provider's session cap) without telling the user
 MAX_QUICK_FAILURES = 3
 REOPEN_BACKOFF_S = 0.5
 _COMMIT = object()
@@ -112,12 +113,15 @@ class SttLink:
             if (error is not None and not error.retryable) or quick_failures > MAX_QUICK_FAILURES:
                 await self._on_status(LinkStatus.FAILED, error)
                 return
-            if error is not None:
+            visible = error is not None and lifetime <= STABLE_AFTER_S
+            if error is not None and not visible:
+                log.info("stt stream rotated", extra={"lifetime_s": round(lifetime)})
+            if visible:
                 await self._on_status(LinkStatus.RECONNECTING, error)
             stream = await self._reopen()
             if stream is None:
                 return
-            if error is not None:
+            if visible:
                 await self._on_status(LinkStatus.RESTORED, None)
 
     async def _reopen(self) -> SpeechToTextStream | None:

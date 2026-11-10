@@ -23,7 +23,11 @@ class ScriptedLLM(LanguageModel):
         self.calls = 0
 
     async def stream(
-        self, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec] = ()
+        self,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec] = (),
+        *,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[LLMChunk]:
         self.calls += 1
         if self.error:

@@ -241,3 +241,17 @@ async def test_transport_failure_is_retryable() -> None:
     with pytest.raises(ProviderError) as info:
         await run(make_llm(handler))
     assert info.value.retryable is True
+
+
+async def test_reply_budget_defaults_to_settings_and_can_be_raised_per_call() -> None:
+    seen: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return sse_body("[DONE]")
+
+    llm = make_llm(handler)
+    await run(llm)
+    await run(llm, max_tokens=1200)
+    assert [body["max_tokens"] for body in seen] == [SETTINGS.llm_max_tokens, 1200]
+    assert SETTINGS.llm_max_tokens == 400

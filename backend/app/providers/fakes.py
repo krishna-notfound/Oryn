@@ -90,11 +90,17 @@ class FakeLanguageModel(LanguageModel):
         self.reply = reply
         self.delay = delay
         self.calls: list[list[ChatMessage]] = []
+        self.max_tokens: list[int | None] = []
 
     async def stream(
-        self, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec] = ()
+        self,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec] = (),
+        *,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[LLMChunk]:
         self.calls.append(list(messages))
+        self.max_tokens.append(max_tokens)
         for word in self.reply.split(" "):
             await asyncio.sleep(self.delay)
             yield LLMChunk(text=word + " ")
